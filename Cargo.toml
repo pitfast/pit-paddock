@@ -1,0 +1,22 @@
+[workspace]
+members = [
+    "crates/pit-paddock-core",
+    "crates/pit-paddock-fs",
+    "crates/pit-paddock-s3",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+pit-artifact = { path = "../pit-crew/crates/pit-artifact" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tokio = { version = "1.53", features = ["fs", "io-util", "macros", "rt-multi-thread"] }
+wasmparser = "0.240"

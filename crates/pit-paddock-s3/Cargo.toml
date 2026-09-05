@@ -1,0 +1,18 @@
+[package]
+name = "pit-paddock-s3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "S3-compatible backend for PitFast Paddock"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+pit-artifact.workspace = true
+pit-paddock-core = { path = "../pit-paddock-core" }
+serde_json.workspace = true
+s3 = "0.1.36"
+
+[dev-dependencies]
+pit-paddock-core = { path = "../pit-paddock-core" }
+tokio.workspace = true

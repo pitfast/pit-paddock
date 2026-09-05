@@ -1,0 +1,18 @@
+[package]
+name = "pit-paddock-fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Filesystem backend for PitFast Paddock"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+pit-artifact.workspace = true
+pit-paddock-core = { path = "../pit-paddock-core" }
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23"
+
