@@ -212,7 +212,7 @@ pub trait PaddockBackend: Send + Sync {
     async fn list_refs(&self, name: Option<&ArtifactName>) -> Result<Vec<ResolvedRef>>;
 }
 
-pub async fn push<B: PaddockBackend>(
+pub async fn push<B: PaddockBackend + ?Sized>(
     backend: &B,
     reference: &PaddockRef,
     manifest: ArtifactManifest,
@@ -248,7 +248,7 @@ pub async fn push<B: PaddockBackend>(
     ))
 }
 
-pub async fn pull<B: PaddockBackend>(
+pub async fn pull<B: PaddockBackend + ?Sized>(
     backend: &B,
     reference: Option<&PaddockRef>,
     digest: Option<&ArtifactDigest>,

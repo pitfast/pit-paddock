@@ -60,3 +60,12 @@ prepared.
 
 S3 integration is supported by the library backend and is exercised only when
 an explicit real S3-compatible test configuration is provided.
+
+## Named Paddocks
+
+The `pit-paddock-factory` crate owns the shared configuration model used by
+the CLI and deployment tooling. A project or user configuration can define
+named filesystem and S3-compatible Paddocks; credentials are resolved from
+host environment variables when the backend is opened. The default name is
+`local`. The factory returns the existing `PaddockBackend` abstraction, so
+deployment and rollback do not contain provider-specific branches.

@@ -1,0 +1,17 @@
+[package]
+name = "pit-paddock-factory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Named PitFast Paddock configuration and backend factory"
+
+[dependencies]
+anyhow.workspace = true
+pit-paddock-core = { path = "../pit-paddock-core" }
+pit-paddock-fs = { path = "../pit-paddock-fs" }
+pit-paddock-s3 = { path = "../pit-paddock-s3" }
+serde.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23"
