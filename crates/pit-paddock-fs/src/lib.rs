@@ -216,6 +216,8 @@ mod tests {
                 target: "wasm32-wasip1".into(),
                 profile: BuildProfile::Release,
                 fingerprint: "a".repeat(64),
+                toolchain: None,
+                toolchain_version: None,
             },
             runtime: RuntimeSpec {
                 abi: RuntimeAbi::wasi_preview1(),
