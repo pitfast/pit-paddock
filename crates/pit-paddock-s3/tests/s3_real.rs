@@ -45,6 +45,9 @@ async fn real_s3_roundtrip_when_configured() {
             fingerprint: "a".repeat(64),
             toolchain: None,
             toolchain_version: None,
+            application_interface: None,
+            adapter: None,
+            adapter_digest: None,
         },
         runtime: RuntimeSpec {
             abi: RuntimeAbi::wasi_preview1(),
