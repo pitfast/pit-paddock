@@ -100,10 +100,15 @@ The separate [`gateway/`](gateway/) workload is the inbound compatibility
 proof. It is a normal `wasi:http/proxy` component that imports only the generic
 Paddock capability plus a host-owned authentication capability and is intended
 to run through PitLane. Its alpha subset is object `PUT`, `GET`, `HEAD`,
-`DELETE`, prefix listing, and single-range reads. Header-based AWS SigV4 is
-supported with a 15-minute clock-skew window; presigned URLs, multipart upload,
-bucket policies, and full S3 compatibility are intentionally not claimed. It
-has no resident guest server; each request executes and then ends.
+`DELETE`, prefix listing, and single-range reads. The gateway returns the
+documented S3 XML subset, exposes deterministic ETags, and authenticates
+header-signed AWS SigV4 requests with a 15-minute clock-skew window. Multipart
+upload is bounded and durable across request executions. Presigned URLs,
+conditional requests, bucket policies, and full S3 compatibility are
+intentionally not claimed. It has no resident guest server; each request
+executes and then ends. AWS CLI 1.46.x is covered by the local interoperability
+test; other clients may require response-header features not yet exposed by
+the current HTTP component ABI.
 
 ## Object contract
 

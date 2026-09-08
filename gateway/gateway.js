@@ -15,6 +15,7 @@ const MAX_MULTIPART_XML_BYTES = 64 * 1024;
 const MAX_MULTIPART_PARTS = 10_000;
 const MAX_MULTIPART_PART_BYTES = 128 * 1024 * 1024;
 const MULTIPART_PREFIX = '__paddock_multipart/';
+const S3_LAST_MODIFIED = 'Wed, 01 Jan 2020 00:00:00 GMT';
 let uploadSequence = 0;
 
 // Legacy signing helpers remain below as non-executed reference code. The
@@ -181,9 +182,9 @@ function validateAuth(request, payloadHash) {
 
 function response(status, body = new Uint8Array(), contentType = 'text/plain', extraHeaders = []) {
   const headers = new Fields();
-  headers.set('content-type', contentType);
-  headers.set('cache-control', 'no-store');
-  for (const [name, value] of extraHeaders) headers.set(name, value);
+  headers.set('content-type', [text(contentType)]);
+  headers.set('cache-control', [text('no-store')]);
+  for (const [name, value] of extraHeaders) headers.set(name, [text(value)]);
   const outgoing = new OutgoingResponse(headers);
   outgoing.setStatusCode(status);
   const output = outgoing.body();
@@ -254,12 +255,16 @@ function targetFromRequest(request) {
   const bucketPrefix = `${namespace}/`;
   if (relative === namespace) return { bucket: namespace, key: null };
   if (relative.startsWith(bucketPrefix)) {
-    const key = relative.slice(bucketPrefix.length);
+    const key = decodeObjectKey(relative.slice(bucketPrefix.length));
     return { bucket: namespace, key: key.length > 0 ? key : null };
   }
   // Retain the original alpha route shape (/object-key) for callers that do
   // not model S3 buckets. S3 clients can use /s3-alpha/object-key.
-  return { bucket: null, key: relative };
+  return { bucket: null, key: decodeObjectKey(relative) };
+}
+
+function decodeObjectKey(value) {
+  return value.split('/').map(segment => decodeURIComponent(segment)).join('/');
 }
 
 function queryFromRequest(request) {
@@ -309,6 +314,18 @@ function xmlEscape(value) {
 function s3Error(status, code, message) {
   const body = `<Error><Code>${xmlEscape(code)}</Code><Message>${xmlEscape(message)}</Message></Error>`;
   return response(status, text(body.slice(0, MAX_ERROR_BYTES)), 'application/xml');
+}
+
+function objectEtag(object) {
+  return `"${String(object.digest).replace(/^sha256:/, '')}"`;
+}
+
+function listXml(objects) {
+  const visible = objects.filter(object => !object.key.startsWith(MULTIPART_PREFIX));
+  const entries = visible
+    .map(object => `<Contents><Key>${xmlEscape(object.key)}</Key><LastModified>2020-01-01T00:00:00.000Z</LastModified><ETag>${xmlEscape(objectEtag(object))}</ETag><Size>${xmlEscape(String(object.size))}</Size><StorageClass>STANDARD</StorageClass></Contents>`)
+    .join('');
+  return `<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>${xmlEscape(namespace)}</Name><KeyCount>${visible.length}</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>${entries}</ListBucketResult>`;
 }
 
 function multipartId() {
@@ -455,7 +472,7 @@ function completeMultipart(request, key, uploadId) {
     }
     const committed = writer.commit();
     cleanupMultipart(uploadId);
-    return response(200, text(`<CompleteMultipartUploadResult><Key>${xmlEscape(key)}</Key><VersionId>${xmlEscape(String(committed.version))}</VersionId></CompleteMultipartUploadResult>`), 'application/xml');
+    return response(200, text(`<CompleteMultipartUploadResult><Key>${xmlEscape(key)}</Key><ETag>${xmlEscape(objectEtag(committed))}</ETag><VersionId>${xmlEscape(String(committed.version))}</VersionId></CompleteMultipartUploadResult>`), 'application/xml');
   } catch (error) {
     try { writer.abort(); } catch (_) { /* best effort; incomplete object is not visible */ }
     throw error;
@@ -515,13 +532,11 @@ export const incomingHandler = {
       }
       if (authenticationError !== null) {
         result = authenticationError;
+      } else if (key === null && method === 'GET' && query.has('location')) {
+        result = response(200, text('<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></LocationConstraint>'), 'application/xml');
       } else if (key === null && method === 'GET' && (query.get('list-type') === '2' || bucketRequest)) {
         const listed = store.listObjects(namespace, query.get('prefix'));
-        result = response(200, text(JSON.stringify({
-            name: namespace,
-            keyCount: listed.length,
-            keys: listed.map(objectJson),
-          }) + '\n'), 'application/json');
+        result = response(200, text(listXml(listed)), 'application/xml');
       } else if (bucketRequest && key === null && method === 'HEAD') {
         result = response(200);
       } else if (bucketRequest && key === null && method === 'PUT') {
@@ -555,7 +570,7 @@ export const incomingHandler = {
             result = s3Error(400, 'InvalidRequest', 'Content-Length does not match the request body');
           } else {
           const committed = writer.commit();
-          result = response(200, text(JSON.stringify(objectJson(committed)) + '\n'), 'application/json');
+          result = response(200, new Uint8Array(), 'application/xml', [['etag', objectEtag(committed)]]);
           }
         } else if (method === 'GET' || method === 'HEAD') {
           let found;
@@ -567,7 +582,11 @@ export const incomingHandler = {
           if (found === null) {
             result = s3Error(404, 'NoSuchKey', 'The specified key does not exist.');
           } else if (method === 'HEAD') {
-            result = response(200, new Uint8Array(), found.contentType ?? 'application/octet-stream', [['accept-ranges', 'bytes']]);
+            result = response(200, new Uint8Array(), found.contentType ?? 'application/octet-stream', [
+              ['accept-ranges', 'bytes'],
+              ['etag', objectEtag(found)],
+              ['last-modified', S3_LAST_MODIFIED],
+            ]);
           } else {
             const range = firstHeaderValue(request.headers(), 'range');
             let offset = 0n;
@@ -589,7 +608,11 @@ export const incomingHandler = {
             }
             if (result === undefined) {
               const bytes = store.readRange(namespace, key, offset, length);
-              const headers = [['accept-ranges', 'bytes']];
+              const headers = [
+                ['accept-ranges', 'bytes'],
+                ['etag', objectEtag(found)],
+                ['last-modified', S3_LAST_MODIFIED],
+              ];
               result = response(range === null ? 200 : 206, bytes, found.contentType ?? 'application/octet-stream', headers);
             }
           }

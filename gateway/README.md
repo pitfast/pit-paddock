@@ -27,18 +27,21 @@ commands, validates the resulting `wasi:http/proxy` component, and prints its
 SHA-256. `package-gateway.sh` creates a consumer package containing only the
 canonical `.wasm` and a small manifest; `.cwasm` is never distributed.
 
-The current protocol is deliberately partial: the host HTTP layer supplies
-`Content-Length` on responses, while the gateway validates request
-`Content-Length`, supports one `bytes=start-end` range, and returns bounded XML
-errors/results for multipart operations. The generic store ABI currently
-returns bounded range chunks rather than exposing a guest read stream;
-completion therefore copies each part in 64 KiB chunks. `Content-Range`, ETag
-headers, presigned URLs, XML list responses, and bucket management remain
-deferred until their ABI and interoperability tests are complete. In the
-current Wasmtime/WASI HTTP path, adding a `Content-Range` response field is
-rejected by the component response-header ABI with `source array is too long`;
-the gateway deliberately does not advertise that field until the ABI issue is
-fixed and regression-tested.
+The current protocol is deliberately partial: the gateway validates request
+`Content-Length`, returns XML success/error/list bodies, exposes deterministic
+ETag and `Accept-Ranges` headers, supports one `bytes=start-end` range, and
+copies multipart parts in 64 KiB chunks. `Content-Range`, presigned URLs,
+conditional requests, and bucket management remain deferred. In the current
+Wasmtime/WASI HTTP path, adding a `Content-Range` response field is rejected by
+the component response-header ABI with `source array is too long`; the gateway
+deliberately does not advertise that field until the ABI issue is fixed and
+regression-tested. The current ABI also does not reliably permit an explicit
+object-sized `Content-Length` on a HEAD response, so AWS CLI interoperability
+is validated while clients that require that metadata (such as the tested mc
+version) remain partial.
+
+AWS CLI 1.46.1 successfully exercises signed PUT, HEAD, GET, LIST, DELETE,
+UTF-8/space-containing keys, and range GET against the PitLane-routed gateway.
 
 For S3-shaped clients the fixed alpha bucket route is
 `/s3-alpha/<object-key>`; the legacy `/<object-key>` route is retained for
