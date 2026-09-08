@@ -179,10 +179,11 @@ function validateAuth(request, payloadHash) {
   return null;
 }
 
-function response(status, body = new Uint8Array(), contentType = 'text/plain') {
+function response(status, body = new Uint8Array(), contentType = 'text/plain', extraHeaders = []) {
   const headers = new Fields();
   headers.set('content-type', contentType);
   headers.set('cache-control', 'no-store');
+  for (const [name, value] of extraHeaders) headers.set(name, value);
   const outgoing = new OutgoingResponse(headers);
   outgoing.setStatusCode(status);
   const output = outgoing.body();
@@ -551,7 +552,7 @@ export const incomingHandler = {
           if (found === null) {
             result = s3Error(404, 'NoSuchKey', 'The specified key does not exist.');
           } else if (method === 'HEAD') {
-            result = response(200, new Uint8Array(), found.contentType ?? 'application/octet-stream');
+            result = response(200, new Uint8Array(), found.contentType ?? 'application/octet-stream', [['accept-ranges', 'bytes']]);
           } else {
             const range = firstHeaderValue(request.headers(), 'range');
             let offset = 0n;
@@ -573,7 +574,8 @@ export const incomingHandler = {
             }
             if (result === undefined) {
               const bytes = store.readRange(namespace, key, offset, length);
-              result = response(range === null ? 200 : 206, bytes, found.contentType ?? 'application/octet-stream');
+              const headers = [['accept-ranges', 'bytes']];
+              result = response(range === null ? 200 : 206, bytes, found.contentType ?? 'application/octet-stream', headers);
             }
           }
         } else if (method === 'DELETE') {

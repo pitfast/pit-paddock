@@ -34,4 +34,8 @@ errors/results for multipart operations. The generic store ABI currently
 returns bounded range chunks rather than exposing a guest read stream;
 completion therefore copies each part in 64 KiB chunks. `Content-Range`, ETag
 headers, presigned URLs, XML list responses, and bucket management remain
-deferred until their ABI and interoperability tests are complete.
+deferred until their ABI and interoperability tests are complete. In the
+current Wasmtime/WASI HTTP path, adding a `Content-Range` response field is
+rejected by the component response-header ABI with `source array is too long`;
+the gateway deliberately does not advertise that field until the ABI issue is
+fixed and regression-tested.
