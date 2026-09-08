@@ -32,6 +32,8 @@ jobs:
         with:
           repository: pitfast/pit-crew
           path: pit-crew
+      - name: Link sibling path dependency
+        run: ln -s "$GITHUB_WORKSPACE/pit-crew" "$GITHUB_WORKSPACE/../pit-crew"
       - uses: dtolnay/rust-toolchain@stable
       - name: Create test bucket
         env:
