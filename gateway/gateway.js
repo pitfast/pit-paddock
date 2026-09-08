@@ -246,11 +246,20 @@ function streamBody(request, writer, maxBytes = null) {
   return size;
 }
 
-function keyFromRequest(request) {
+function targetFromRequest(request) {
   const path = request.pathWithQuery().split('?', 1)[0];
-  if (!path.startsWith('/')) return null;
-  const key = path.slice(1);
-  return key.length > 0 ? key : null;
+  if (!path.startsWith('/')) return { bucket: null, key: null };
+  const relative = path.slice(1);
+  if (relative === '') return { bucket: null, key: null };
+  const bucketPrefix = `${namespace}/`;
+  if (relative === namespace) return { bucket: namespace, key: null };
+  if (relative.startsWith(bucketPrefix)) {
+    const key = relative.slice(bucketPrefix.length);
+    return { bucket: namespace, key: key.length > 0 ? key : null };
+  }
+  // Retain the original alpha route shape (/object-key) for callers that do
+  // not model S3 buckets. S3 clients can use /s3-alpha/object-key.
+  return { bucket: null, key: relative };
 }
 
 function queryFromRequest(request) {
@@ -492,25 +501,31 @@ export const incomingHandler = {
   handle(request, responseOutparam) {
     let result;
     try {
-      const key = keyFromRequest(request);
+      const target = targetFromRequest(request);
+      const key = target.key;
+      const bucketRequest = target.bucket !== null;
       const method = methodName(request);
       const query = queryFromRequest(request);
       const declaredPayloadHash = firstHeaderValue(request.headers(), 'x-amz-content-sha256');
       let authenticationError = null;
       try {
         auth.verify();
-      } catch (_) {
-        authenticationError = s3Error(403, 'AccessDenied', 'request authentication failed');
+      } catch (error) {
+        authenticationError = s3Error(403, 'AccessDenied', errorText(error).slice(0, MAX_ERROR_BYTES));
       }
       if (authenticationError !== null) {
         result = authenticationError;
-      } else if (key === null && method === 'GET' && query.get('list-type') === '2') {
+      } else if (key === null && method === 'GET' && (query.get('list-type') === '2' || bucketRequest)) {
         const listed = store.listObjects(namespace, query.get('prefix'));
         result = response(200, text(JSON.stringify({
             name: namespace,
             keyCount: listed.length,
             keys: listed.map(objectJson),
           }) + '\n'), 'application/json');
+      } else if (bucketRequest && key === null && method === 'HEAD') {
+        result = response(200);
+      } else if (bucketRequest && key === null && method === 'PUT') {
+        result = response(200);
       } else if (key === null) {
         result = response(400, text('object key is required\n'));
       } else {

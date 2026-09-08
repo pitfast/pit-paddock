@@ -39,3 +39,9 @@ current Wasmtime/WASI HTTP path, adding a `Content-Range` response field is
 rejected by the component response-header ABI with `source array is too long`;
 the gateway deliberately does not advertise that field until the ABI issue is
 fixed and regression-tested.
+
+For S3-shaped clients the fixed alpha bucket route is
+`/s3-alpha/<object-key>`; the legacy `/<object-key>` route is retained for
+the PitFast-native smoke harness. Header SigV4 accepts the AWS
+`STREAMING-AWS4-HMAC-SHA256-PAYLOAD` request marker after PitLane has decoded
+the body, but does not claim wire-level per-chunk signature verification.
