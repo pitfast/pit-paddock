@@ -34,6 +34,14 @@ pub struct S3Paddock {
     object_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<s3::Error>().is_some_and(
+            |remote| matches!(remote, s3::Error::Api { status, .. } if status.as_u16() == 404),
+        )
+    })
+}
+
 impl S3Paddock {
     pub fn from_config(config: S3PaddockConfig) -> Result<Self> {
         let access = std::env::var(&config.access_key_env).with_context(|| {
@@ -101,6 +109,14 @@ impl S3Paddock {
         serde_json::from_slice(&bytes).context("malformed remote Paddock object ref")
     }
 
+    async fn read_optional_object_record(&self, key: String) -> Result<Option<ObjectRef>> {
+        match self.read_object_record(key).await {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if is_not_found(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn put_object_record(&self, key: String, value: &ObjectRef) -> Result<()> {
         self.client
             .objects()
@@ -110,6 +126,20 @@ impl S3Paddock {
             .send()
             .await?;
         Ok(())
+    }
+
+    async fn object_exists(&self, key: String) -> Result<bool> {
+        match self.client.objects().head(&self.bucket, key).send().await {
+            Ok(_) => Ok(true),
+            Err(error) => {
+                let error: anyhow::Error = error.into();
+                if is_not_found(&error) {
+                    Ok(false)
+                } else {
+                    Err(error).context("S3 HEAD failed while checking object existence")
+                }
+            }
+        }
     }
 }
 
@@ -158,15 +188,7 @@ impl ObjectWriter for S3ObjectWriter {
         drop(file);
         let digest = BlobDigest::from_sha256_digest(self.hasher.clone().finalize().into());
         let blob_key = S3Paddock::generic_blob_key(&digest);
-        if self
-            .backend
-            .client
-            .objects()
-            .head(&self.backend.bucket, blob_key.clone())
-            .send()
-            .await
-            .is_err()
-        {
+        if !self.backend.object_exists(blob_key.clone()).await? {
             let file = tokio::fs::File::open(&self.temp).await?;
             let stream = stream::unfold(file, |mut file| async move {
                 let mut buffer = vec![0_u8; 64 * 1024];
@@ -191,9 +213,8 @@ impl ObjectWriter for S3ObjectWriter {
         let current_key = S3Paddock::object_key(&self.namespace, &self.key, "current.json");
         let current = self
             .backend
-            .read_object_record(current_key.clone())
-            .await
-            .ok();
+            .read_optional_object_record(current_key.clone())
+            .await?;
         if let Some(expected) = self.expected_version
             && Some(expected) != current.as_ref().map(|value| value.version)
         {
@@ -244,13 +265,7 @@ impl ObjectWriter for S3ObjectWriter {
 #[async_trait]
 impl PaddockBackend for S3Paddock {
     async fn has_blob(&self, digest: &ArtifactDigest) -> Result<bool> {
-        Ok(self
-            .client
-            .objects()
-            .head(&self.bucket, Self::blob_key(digest))
-            .send()
-            .await
-            .is_ok())
+        self.object_exists(Self::blob_key(digest)).await
     }
 
     async fn put_blob(&self, digest: &ArtifactDigest, bytes: &[u8]) -> Result<BlobPut> {
@@ -290,11 +305,17 @@ impl PaddockBackend for S3Paddock {
         if manifest.artifact.sha256 != digest.hex() {
             bail!("manifest digest does not match {}", digest);
         }
-        if let Ok(existing) = self.get_manifest(digest).await {
-            if existing != *manifest {
-                bail!("immutable manifest {} has different metadata", digest);
+        match self.get_manifest(digest).await {
+            Ok(existing) => {
+                if existing != *manifest {
+                    bail!("immutable manifest {} has different metadata", digest);
+                }
+                return Ok(());
             }
-            return Ok(());
+            Err(error) if !is_not_found(&error) => {
+                return Err(error).context("S3 manifest lookup failed before upload");
+            }
+            Err(_) => {}
         }
         self.client
             .objects()
@@ -319,8 +340,17 @@ impl PaddockBackend for S3Paddock {
     }
 
     async fn set_ref(&self, reference: &PaddockRef, digest: &ArtifactDigest) -> Result<()> {
-        if !self.has_blob(digest).await? || self.get_manifest(digest).await.is_err() {
+        if !self.has_blob(digest).await? {
             bail!("cannot publish ref before blob {}", digest);
+        }
+        match self.get_manifest(digest).await {
+            Ok(_) => {}
+            Err(error) if is_not_found(&error) => {
+                bail!("cannot publish ref before manifest {}", digest);
+            }
+            Err(error) => {
+                return Err(error).context("S3 manifest lookup failed before ref publish");
+            }
         }
         self.client
             .objects()
@@ -391,10 +421,11 @@ impl PaddockObjectBackend for S3Paddock {
         PaddockCapabilities {
             range_read: true,
             streaming_write: true,
-            atomic_ref_replace: true,
-            // The SDK/backend has no portable conditional pointer publication
-            // primitive exposed here. Do not advertise a fake CAS guarantee.
+            // Version metadata and the current pointer are separate S3
+            // objects. The SDK has no portable conditional pointer
+            // publication primitive, so cross-process CAS is not advertised.
             conditional_ref_update: false,
+            atomic_ref_replace: false,
             durable_sync: true,
         }
     }
@@ -402,14 +433,7 @@ impl PaddockObjectBackend for S3Paddock {
     async fn put_blob_bytes(&self, bytes: &[u8]) -> Result<(BlobDigest, BlobSize)> {
         let digest = BlobDigest::from_bytes(bytes);
         let key = Self::generic_blob_key(&digest);
-        if self
-            .client
-            .objects()
-            .head(&self.bucket, key.clone())
-            .send()
-            .await
-            .is_err()
-        {
+        if !self.object_exists(key.clone()).await? {
             self.client
                 .objects()
                 .put(&self.bucket, key)
@@ -483,7 +507,8 @@ impl PaddockObjectBackend for S3Paddock {
     ) -> Result<Box<dyn ObjectWriter>> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let temp = std::env::temp_dir().join(format!(
-            "pit-paddock-s3-object-{}.tmp",
+            "pit-paddock-s3-object-{}-{}.tmp",
+            std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         let file = tokio::fs::OpenOptions::new()
