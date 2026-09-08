@@ -35,7 +35,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Create test bucket
         run: |
-          curl --fail --retry 10 --retry-delay 1 -X PUT http://127.0.0.1:9000/pitfast-test
+          curl --fail --retry 10 --retry-delay 1 -o /tmp/mc \
+            https://dl.min.io/client/mc/release/linux-amd64/mc
+          chmod +x /tmp/mc
+          /tmp/mc alias set local http://127.0.0.1:9000 pitfast-test pitfast-test-secret-123
+          /tmp/mc mb --ignore-existing local/pitfast-test
       - name: Run real S3 backend tests
         env:
           PITFAST_TEST_S3_ENDPOINT: http://127.0.0.1:9000
