@@ -613,6 +613,9 @@ export const incomingHandler = {
                 ['etag', objectEtag(found)],
                 ['last-modified', S3_LAST_MODIFIED],
               ];
+              if (range !== null) {
+                headers.push(['content-range', `bytes ${offset}-${offset + BigInt(bytes.length) - 1n}/${found.size}`]);
+              }
               result = response(range === null ? 200 : 206, bytes, found.contentType ?? 'application/octet-stream', headers);
             }
           }

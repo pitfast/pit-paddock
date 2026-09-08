@@ -16,7 +16,7 @@
     "HEAD",
     "DELETE",
     "ListObjectsV2-style listing",
-    "single-range GET",
+    "single-range GET with Content-Range",
     "header-based AWS SigV4",
     "bounded multipart upload"
   ],
