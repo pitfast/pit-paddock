@@ -17,7 +17,8 @@
     "DELETE",
     "ListObjectsV2-style listing",
     "single-range GET",
-    "header-based AWS SigV4"
+    "header-based AWS SigV4",
+    "bounded multipart upload"
   ],
   "canonical_artifact": true,
   "derived_cwasm_distributed": false

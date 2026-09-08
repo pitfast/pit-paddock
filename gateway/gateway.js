@@ -11,6 +11,11 @@ import * as auth from 'pitfast:paddock/auth@0.1.0';
 
 const namespace = 's3-alpha';
 const MAX_ERROR_BYTES = 4096;
+const MAX_MULTIPART_XML_BYTES = 64 * 1024;
+const MAX_MULTIPART_PARTS = 10_000;
+const MAX_MULTIPART_PART_BYTES = 128 * 1024 * 1024;
+const MULTIPART_PREFIX = '__paddock_multipart/';
+let uploadSequence = 0;
 
 // Legacy signing helpers remain below as non-executed reference code. The
 // active verifier is host-owned so credentials never enter the guest module.
@@ -206,7 +211,7 @@ function text(value) {
   return new TextEncoder().encode(value);
 }
 
-function streamBody(request, writer) {
+function streamBody(request, writer, maxBytes = null) {
   const body = request.consume();
   const input = body.stream();
   let size = 0n;
@@ -223,6 +228,9 @@ function streamBody(request, writer) {
         throw error;
       }
       if (chunk.length === 0) continue;
+      if (maxBytes !== null && size + BigInt(chunk.length) > BigInt(maxBytes)) {
+        throw new Error('request body exceeds the configured object size limit');
+      }
       writer.write(chunk);
       size += BigInt(chunk.length);
     }
@@ -293,6 +301,192 @@ function s3Error(status, code, message) {
   return response(status, text(body.slice(0, MAX_ERROR_BYTES)), 'application/xml');
 }
 
+function multipartId() {
+  // The identifier is only an opaque durable namespace key. It is never used
+  // as an authority token. Include time, a per-instance sequence, and random
+  // entropy so independently spawned disposable gateway executions do not
+  // normally collide while the upload state itself remains in Paddock.
+  const entropy = Math.floor(Math.random() * 0x100000000).toString(16).padStart(8, '0');
+  const sequence = (uploadSequence++).toString(36);
+  return `${Date.now().toString(36)}-${sequence}-${entropy}`;
+}
+
+function multipartPartKey(uploadId, partNumber) {
+  return `${MULTIPART_PREFIX}${uploadId}/part/${partNumber}`;
+}
+
+function multipartMetaKey(uploadId) {
+  return `${MULTIPART_PREFIX}${uploadId}/meta`;
+}
+
+function putSmallObject(key, bytes, contentType) {
+  const writer = store.beginWrite(namespace, key, contentType);
+  writer.write(bytes);
+  return writer.commit();
+}
+
+function readSmallObject(key) {
+  let object;
+  try {
+    object = store.get(namespace, key);
+  } catch (_) {
+    return null;
+  }
+  if (object === null || BigInt(object.size) > BigInt(MAX_MULTIPART_XML_BYTES)) return null;
+  return store.readRange(namespace, key, 0n, BigInt(object.size));
+}
+
+function multipartMeta(uploadId) {
+  const bytes = readSmallObject(multipartMetaKey(uploadId));
+  if (bytes === null) return null;
+  try {
+    const meta = JSON.parse(new TextDecoder().decode(Uint8Array.from(bytes)));
+    if (typeof meta.key !== 'string' || typeof meta.contentType !== 'string' && meta.contentType !== null) return null;
+    return meta;
+  } catch (_) {
+    return null;
+  }
+}
+
+function multipartXmlParts(bytes) {
+  if (bytes.length > MAX_MULTIPART_XML_BYTES) throw new Error('multipart completion XML exceeds the configured limit');
+  const xml = new TextDecoder().decode(Uint8Array.from(bytes));
+  if (!/^\s*<CompleteMultipartUpload[\s>]/.test(xml) || !/<\/CompleteMultipartUpload>\s*$/.test(xml)) {
+    throw new Error('invalid CompleteMultipartUpload XML');
+  }
+  const parts = [];
+  const pattern = /<Part>\s*<PartNumber>(\d+)<\/PartNumber>\s*(?:<ETag>[^<]*<\/ETag>\s*)?<\/Part>/g;
+  let match;
+  while ((match = pattern.exec(xml)) !== null) {
+    const number = Number(match[1]);
+    if (!Number.isSafeInteger(number) || number < 1 || number > MAX_MULTIPART_PARTS) {
+      throw new Error('multipart part number is out of range');
+    }
+    if (parts.length > 0 && number <= parts[parts.length - 1]) {
+      throw new Error('multipart parts must be listed in strictly increasing order');
+    }
+    parts.push(number);
+  }
+  if (parts.length === 0) throw new Error('multipart completion requires at least one part');
+  if (parts.length > MAX_MULTIPART_PARTS) throw new Error('multipart part count exceeds the configured limit');
+  return parts;
+}
+
+function multipartObjects(uploadId) {
+  return store.listObjects(namespace, `${MULTIPART_PREFIX}${uploadId}/part/`)
+    .filter(object => !object.deleted);
+}
+
+function cleanupMultipart(uploadId) {
+  for (const object of multipartObjects(uploadId)) {
+    try { store.delete(namespace, object.key); } catch (_) { /* deferred cleanup is safe */ }
+  }
+  try { store.delete(namespace, multipartMetaKey(uploadId)); } catch (_) { /* deferred cleanup is safe */ }
+}
+
+function createMultipart(key, contentType) {
+  const uploadId = multipartId();
+  putSmallObject(multipartMetaKey(uploadId), text(JSON.stringify({ key, contentType })), 'application/json');
+  return response(200, text(`<InitiateMultipartUploadResult><Bucket>${xmlEscape(namespace)}</Bucket><Key>${xmlEscape(key)}</Key><UploadId>${xmlEscape(uploadId)}</UploadId></InitiateMultipartUploadResult>`), 'application/xml');
+}
+
+function uploadMultipartPart(request, key, uploadId, partNumber) {
+  const number = Number(partNumber);
+  if (!Number.isSafeInteger(number) || number < 1 || number > MAX_MULTIPART_PARTS) {
+    return s3Error(400, 'InvalidRequest', 'partNumber must be between 1 and 10000');
+  }
+  const meta = multipartMeta(uploadId);
+  if (meta === null || meta.key !== key) return s3Error(404, 'NoSuchUpload', 'The specified multipart upload does not exist.');
+  const writer = store.beginWrite(namespace, multipartPartKey(uploadId, number), meta.contentType);
+  const declaredLength = firstHeaderValue(request.headers(), 'content-length');
+  let written;
+  try {
+    written = streamBody(request, writer, MAX_MULTIPART_PART_BYTES);
+  } catch (error) {
+    try { writer.abort(); } catch (_) { /* best effort; incomplete part is not visible */ }
+    throw error;
+  }
+  if (declaredLength !== null && (!/^\d+$/.test(declaredLength) || BigInt(declaredLength) !== written)) {
+    writer.abort();
+    return s3Error(400, 'InvalidRequest', 'Content-Length does not match the request body');
+  }
+  writer.commit();
+  return response(200);
+}
+
+function completeMultipart(request, key, uploadId) {
+  const meta = multipartMeta(uploadId);
+  if (meta === null || meta.key !== key) return s3Error(404, 'NoSuchUpload', 'The specified multipart upload does not exist.');
+  let parts;
+  try {
+    parts = multipartXmlParts(readRequestBody(request));
+  } catch (error) {
+    return s3Error(400, 'InvalidRequest', errorText(error));
+  }
+  const available = new Map(multipartObjects(uploadId).map(object => [object.key, object]));
+  for (const number of parts) {
+    if (!available.has(multipartPartKey(uploadId, number))) {
+      return s3Error(400, 'InvalidRequest', `multipart part ${number} is missing`);
+    }
+  }
+  const writer = store.beginWrite(namespace, key, meta.contentType);
+  try {
+    for (const number of parts) {
+      const part = available.get(multipartPartKey(uploadId, number));
+      let offset = 0n;
+      const size = BigInt(part.size);
+      while (offset < size) {
+        const length = size - offset > 65536n ? 65536n : size - offset;
+        const chunk = store.readRange(namespace, part.key, offset, length);
+        if (chunk.length === 0) throw new Error(`multipart part ${number} ended unexpectedly`);
+        writer.write(Uint8Array.from(chunk));
+        offset += BigInt(chunk.length);
+      }
+    }
+    const committed = writer.commit();
+    cleanupMultipart(uploadId);
+    return response(200, text(`<CompleteMultipartUploadResult><Key>${xmlEscape(key)}</Key><VersionId>${xmlEscape(String(committed.version))}</VersionId></CompleteMultipartUploadResult>`), 'application/xml');
+  } catch (error) {
+    try { writer.abort(); } catch (_) { /* best effort; incomplete object is not visible */ }
+    throw error;
+  }
+}
+
+function readRequestBody(request) {
+  const body = request.consume();
+  const input = body.stream();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const ready = input.subscribe();
+      ready.block();
+      ready[Symbol.dispose]();
+      let chunk;
+      try { chunk = input.read(65536n); }
+      catch (error) {
+        if (error?.payload?.tag === 'closed' || error?.tag === 'closed') break;
+        throw error;
+      }
+      if (chunk.length === 0) continue;
+      total += chunk.length;
+      if (total > MAX_MULTIPART_XML_BYTES) throw new Error('request body exceeds the configured multipart XML limit');
+      chunks.push(Uint8Array.from(chunk));
+    }
+  } finally {
+    input[Symbol.dispose]();
+    const trailers = IncomingBody.finish(body);
+    const trailersReady = trailers.subscribe();
+    trailersReady.block();
+    trailersReady[Symbol.dispose]();
+    trailers.get();
+  }
+  const output = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { output.set(chunk, offset); offset += chunk.length; }
+  return output;
+}
+
 export const incomingHandler = {
   handle(request, responseOutparam) {
     let result;
@@ -319,7 +513,23 @@ export const incomingHandler = {
       } else if (key === null) {
         result = response(400, text('object key is required\n'));
       } else {
-        if (method === 'PUT') {
+        const uploadId = query.get('uploadId');
+        const partNumber = query.get('partNumber');
+        if (method === 'PUT' && query.has('uploads') && uploadId === null && partNumber === null) {
+          result = createMultipart(key, firstHeaderValue(request.headers(), 'content-type'));
+        } else if (method === 'PUT' && uploadId !== null && partNumber !== null) {
+          result = uploadMultipartPart(request, key, uploadId, partNumber);
+        } else if (method === 'POST' && uploadId !== null) {
+          result = completeMultipart(request, key, uploadId);
+        } else if (method === 'DELETE' && uploadId !== null) {
+          const meta = multipartMeta(uploadId);
+          if (meta === null || meta.key !== key) {
+            result = s3Error(404, 'NoSuchUpload', 'The specified multipart upload does not exist.');
+          } else {
+            cleanupMultipart(uploadId);
+            result = response(204);
+          }
+        } else if (method === 'PUT') {
           const contentType = firstHeaderValue(request.headers(), 'content-type');
           const writer = store.beginWrite(namespace, key, contentType);
           const declaredLength = firstHeaderValue(request.headers(), 'content-length');
