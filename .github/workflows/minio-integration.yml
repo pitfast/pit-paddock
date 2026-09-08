@@ -34,12 +34,13 @@ jobs:
           path: pit-crew
       - uses: dtolnay/rust-toolchain@stable
       - name: Create test bucket
+        env:
+          AWS_ACCESS_KEY_ID: pitfast-test
+          AWS_SECRET_ACCESS_KEY: pitfast-test-secret-123
+          AWS_DEFAULT_REGION: us-east-1
         run: |
-          curl --fail --retry 10 --retry-delay 1 -o /tmp/mc \
-            https://dl.min.io/client/mc/release/linux-amd64/mc
-          chmod +x /tmp/mc
-          /tmp/mc alias set local http://127.0.0.1:9000 pitfast-test pitfast-test-secret-123
-          /tmp/mc mb --ignore-existing local/pitfast-test
+          aws --endpoint-url http://127.0.0.1:9000 \
+            s3api create-bucket --bucket pitfast-test
       - name: Run real S3 backend tests
         env:
           PITFAST_TEST_S3_ENDPOINT: http://127.0.0.1:9000
