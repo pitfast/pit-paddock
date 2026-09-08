@@ -1,0 +1,8 @@
+io = "deps/io"
+cli = "deps/cli"
+random = "deps/random"
+clocks = "deps/clocks"
+filesystem = "deps/filesystem"
+sockets = "deps/sockets"
+wasi-http = "deps/http"
+paddock = "deps/paddock"

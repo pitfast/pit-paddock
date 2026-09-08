@@ -1,0 +1,36 @@
+package pitfast:paddock@0.1.0;
+
+interface store {
+    record object-ref {
+        namespace: string,
+        key: string,
+        version: u64,
+        digest: string,
+        size: u64,
+        content-type: option<string>,
+        deleted: bool,
+    }
+
+    variant error {
+        invalid(string),
+        denied(string),
+        unavailable(string),
+        conflict(string),
+    }
+
+    resource writer {
+        write: func(chunk: list<u8>) -> result<_, error>;
+        commit: func() -> result<object-ref, error>;
+        abort: func() -> result<_, error>;
+    }
+
+    begin-write: func(namespace: string, key: string, content-type: option<string>) -> result<writer, error>;
+    get: func(namespace: string, key: string) -> result<object-ref, error>;
+    read-range: func(namespace: string, key: string, offset: u64, length: u64) -> result<list<u8>, error>;
+    delete: func(namespace: string, key: string) -> result<_, error>;
+    list-objects: func(namespace: string, prefix: option<string>) -> result<list<object-ref>, error>;
+}
+
+world paddock-consumer {
+    import store;
+}

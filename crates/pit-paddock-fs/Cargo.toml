@@ -11,8 +11,8 @@ async-trait.workspace = true
 pit-artifact.workspace = true
 pit-paddock-core = { path = "../pit-paddock-core" }
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
 tempfile = "3.23"
-

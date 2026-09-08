@@ -5,12 +5,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use pit_paddock_core::PaddockBackend;
+use pit_paddock_core::{PaddockBackend, PaddockObjectBackend};
 use pit_paddock_fs::FilesystemPaddock;
 use pit_paddock_s3::{S3Paddock, S3PaddockConfig};
 use serde::{Deserialize, Serialize};
 
 pub type PaddockHandle = Arc<dyn PaddockBackend>;
+pub type PaddockObjectHandle = Arc<dyn PaddockObjectBackend>;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -89,6 +90,44 @@ impl PaddockConfig {
         name: &str,
         explicit_filesystem_root: Option<PathBuf>,
     ) -> Result<PaddockHandle> {
+        if let Some(root) = explicit_filesystem_root {
+            return Ok(Arc::new(FilesystemPaddock::new(root)));
+        }
+        let definition = self
+            .paddocks
+            .get(name)
+            .with_context(|| format!("unknown Paddock '{name}'"))?;
+        match definition {
+            NamedPaddockConfig::Filesystem { path } => {
+                let root = path.clone().unwrap_or(default_filesystem_root()?);
+                Ok(Arc::new(FilesystemPaddock::new(root)))
+            }
+            NamedPaddockConfig::S3 {
+                endpoint,
+                bucket,
+                region,
+                access_key_env,
+                secret_key_env,
+                session_token_env,
+            } => Ok(Arc::new(S3Paddock::from_config(S3PaddockConfig {
+                endpoint: endpoint.clone(),
+                bucket: bucket.clone(),
+                region: region.clone(),
+                access_key_env: access_key_env.clone(),
+                secret_key_env: secret_key_env.clone(),
+                session_token_env: session_token_env.clone(),
+            })?)),
+        }
+    }
+
+    /// Opens the same configured backend for generic durable objects. Artifact
+    /// and object handles are intentionally separate traits while sharing the
+    /// same physical Paddock configuration.
+    pub fn open_objects(
+        &self,
+        name: &str,
+        explicit_filesystem_root: Option<PathBuf>,
+    ) -> Result<PaddockObjectHandle> {
         if let Some(root) = explicit_filesystem_root {
             return Ok(Arc::new(FilesystemPaddock::new(root)));
         }

@@ -1,14 +1,21 @@
 //! Vendor-neutral S3-compatible Paddock backend.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures_util::stream;
 use pit_artifact::ArtifactManifest;
 use pit_paddock_core::{
-    ArtifactDigest, ArtifactName, BlobPut, PaddockBackend, PaddockRef, PaddockRefWire, ResolvedRef,
+    ArtifactDigest, ArtifactName, BlobDigest, BlobPut, BlobSize, NamespaceId, ObjectKey,
+    ObjectMetadata, ObjectRef, ObjectVersion, ObjectWriter, PaddockBackend, PaddockCapabilities,
+    PaddockObjectBackend, PaddockRef, PaddockRefWire, ResolvedRef,
 };
 use s3::{AddressingStyle, Auth, Client, Credentials};
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Debug, Clone)]
 pub struct S3PaddockConfig {
@@ -24,6 +31,7 @@ pub struct S3PaddockConfig {
 pub struct S3Paddock {
     client: Arc<Client>,
     bucket: String,
+    object_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl S3Paddock {
@@ -59,6 +67,7 @@ impl S3Paddock {
         Ok(Self {
             client: Arc::new(client),
             bucket: config.bucket,
+            object_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -70,6 +79,165 @@ impl S3Paddock {
     }
     fn ref_key(reference: &PaddockRef) -> String {
         format!("refs/{}/{}.json", reference.name, reference.tag)
+    }
+
+    fn generic_blob_key(digest: &BlobDigest) -> String {
+        format!("blobs/sha256/{}/{}.blob", &digest.hex()[..2], digest.hex())
+    }
+
+    fn object_key(namespace: &NamespaceId, key: &ObjectKey, suffix: &str) -> String {
+        format!("objects/{namespace}/{key}/{suffix}")
+    }
+
+    async fn read_object_record(&self, key: String) -> Result<ObjectRef> {
+        let bytes = self
+            .client
+            .objects()
+            .get(&self.bucket, key)
+            .send()
+            .await?
+            .bytes()
+            .await?;
+        serde_json::from_slice(&bytes).context("malformed remote Paddock object ref")
+    }
+
+    async fn put_object_record(&self, key: String, value: &ObjectRef) -> Result<()> {
+        self.client
+            .objects()
+            .put(&self.bucket, key)
+            .body_bytes(serde_json::to_vec(value)?)
+            .content_type("application/json")?
+            .send()
+            .await?;
+        Ok(())
+    }
+}
+
+struct S3ObjectWriter {
+    backend: S3Paddock,
+    namespace: NamespaceId,
+    key: ObjectKey,
+    metadata: ObjectMetadata,
+    expected_version: Option<ObjectVersion>,
+    temp: std::path::PathBuf,
+    file: Option<tokio::fs::File>,
+    hasher: Sha256,
+    size: u64,
+}
+
+impl Drop for S3ObjectWriter {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.temp);
+    }
+}
+
+#[async_trait]
+impl ObjectWriter for S3ObjectWriter {
+    async fn write_chunk(&mut self, bytes: &[u8]) -> Result<()> {
+        let new_size = self
+            .size
+            .checked_add(bytes.len() as u64)
+            .context("object size overflow")?;
+        self.file
+            .as_mut()
+            .context("object writer is already finalized")?
+            .write_all(bytes)
+            .await?;
+        self.hasher.update(bytes);
+        self.size = new_size;
+        Ok(())
+    }
+
+    async fn commit(mut self: Box<Self>) -> Result<ObjectRef> {
+        let _guard = self.backend.object_lock.lock().await;
+        let file = self
+            .file
+            .take()
+            .context("object writer is already finalized")?;
+        file.sync_all().await?;
+        drop(file);
+        let digest = BlobDigest::from_sha256_digest(self.hasher.clone().finalize().into());
+        let blob_key = S3Paddock::generic_blob_key(&digest);
+        if self
+            .backend
+            .client
+            .objects()
+            .head(&self.backend.bucket, blob_key.clone())
+            .send()
+            .await
+            .is_err()
+        {
+            let file = tokio::fs::File::open(&self.temp).await?;
+            let stream = stream::unfold(file, |mut file| async move {
+                let mut buffer = vec![0_u8; 64 * 1024];
+                match file.read(&mut buffer).await {
+                    Ok(0) => None,
+                    Ok(size) => Some((
+                        Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(&buffer[..size])),
+                        file,
+                    )),
+                    Err(error) => Some((Err(error), file)),
+                }
+            });
+            self.backend
+                .client
+                .objects()
+                .put(&self.backend.bucket, blob_key)
+                .body_stream_sized(stream, self.size)
+                .send()
+                .await?;
+        }
+
+        let current_key = S3Paddock::object_key(&self.namespace, &self.key, "current.json");
+        let current = self
+            .backend
+            .read_object_record(current_key.clone())
+            .await
+            .ok();
+        if let Some(expected) = self.expected_version
+            && Some(expected) != current.as_ref().map(|value| value.version)
+        {
+            bail!(
+                "object version condition failed for {}/{}",
+                self.namespace,
+                self.key
+            );
+        }
+        let version = match current.as_ref() {
+            Some(value) => value
+                .version
+                .get()
+                .checked_add(1)
+                .context("object version overflow")?,
+            None => 1,
+        };
+        let record = ObjectRef {
+            namespace: self.namespace.clone(),
+            key: self.key.clone(),
+            version: ObjectVersion::new(version),
+            digest,
+            size: BlobSize::new(self.size),
+            metadata: self.metadata.clone(),
+            deleted: false,
+        };
+        self.backend
+            .put_object_record(
+                S3Paddock::object_key(
+                    &self.namespace,
+                    &self.key,
+                    &format!("versions/{}.json", version),
+                ),
+                &record,
+            )
+            .await?;
+        self.backend.put_object_record(current_key, &record).await?;
+        Ok(record)
+    }
+
+    async fn abort(mut self: Box<Self>) -> Result<()> {
+        self.file.take();
+        let _ = tokio::fs::remove_file(&self.temp).await;
+        Ok(())
     }
 }
 
@@ -214,6 +382,220 @@ impl PaddockBackend for S3Paddock {
                 .cmp(&(b.reference.name.clone(), b.reference.tag.clone()))
         });
         Ok(refs)
+    }
+}
+
+#[async_trait]
+impl PaddockObjectBackend for S3Paddock {
+    fn capabilities(&self) -> PaddockCapabilities {
+        PaddockCapabilities {
+            range_read: true,
+            streaming_write: true,
+            atomic_ref_replace: true,
+            // The SDK/backend has no portable conditional pointer publication
+            // primitive exposed here. Do not advertise a fake CAS guarantee.
+            conditional_ref_update: false,
+            durable_sync: true,
+        }
+    }
+
+    async fn put_blob_bytes(&self, bytes: &[u8]) -> Result<(BlobDigest, BlobSize)> {
+        let digest = BlobDigest::from_bytes(bytes);
+        let key = Self::generic_blob_key(&digest);
+        if self
+            .client
+            .objects()
+            .head(&self.bucket, key.clone())
+            .send()
+            .await
+            .is_err()
+        {
+            self.client
+                .objects()
+                .put(&self.bucket, key)
+                .body_bytes(bytes.to_vec())
+                .content_length(bytes.len() as u64)
+                .send()
+                .await?;
+        } else if self.get_blob_bytes(&digest).await? != bytes {
+            bail!("immutable blob {} has different bytes", digest);
+        }
+        Ok((digest, BlobSize::new(bytes.len() as u64)))
+    }
+
+    async fn get_blob_bytes(&self, digest: &BlobDigest) -> Result<Vec<u8>> {
+        let bytes = self
+            .client
+            .objects()
+            .get(&self.bucket, Self::generic_blob_key(digest))
+            .send()
+            .await?
+            .bytes()
+            .await?
+            .to_vec();
+        if BlobDigest::from_bytes(&bytes) != *digest {
+            bail!("blob {} failed integrity verification", digest);
+        }
+        Ok(bytes)
+    }
+
+    async fn read_blob_range(
+        &self,
+        digest: &BlobDigest,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>> {
+        let head = self
+            .client
+            .objects()
+            .head(&self.bucket, Self::generic_blob_key(digest))
+            .send()
+            .await?;
+        let size = head.content_length.unwrap_or(0);
+        if offset > size {
+            bail!("range offset {offset} exceeds blob size {size}");
+        }
+        if offset == size || length == 0 {
+            return Ok(Vec::new());
+        }
+        let end = offset
+            .checked_add(length - 1)
+            .context("range end overflow")?
+            .min(size - 1);
+        Ok(self
+            .client
+            .objects()
+            .get(&self.bucket, Self::generic_blob_key(digest))
+            .range_bytes(offset, end)?
+            .send()
+            .await?
+            .bytes()
+            .await?
+            .to_vec())
+    }
+
+    async fn begin_object_write(
+        &self,
+        namespace: NamespaceId,
+        key: ObjectKey,
+        metadata: ObjectMetadata,
+        expected_version: Option<ObjectVersion>,
+    ) -> Result<Box<dyn ObjectWriter>> {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let temp = std::env::temp_dir().join(format!(
+            "pit-paddock-s3-object-{}.tmp",
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .await?;
+        Ok(Box::new(S3ObjectWriter {
+            backend: self.clone(),
+            namespace,
+            key,
+            metadata,
+            expected_version,
+            temp,
+            file: Some(file),
+            hasher: Sha256::new(),
+            size: 0,
+        }))
+    }
+
+    async fn get_object(
+        &self,
+        namespace: &NamespaceId,
+        key: &ObjectKey,
+        version: Option<ObjectVersion>,
+    ) -> Result<ObjectRef> {
+        let suffix = match version {
+            Some(version) => format!("versions/{}.json", version.get()),
+            None => "current.json".into(),
+        };
+        let record = self
+            .read_object_record(Self::object_key(namespace, key, &suffix))
+            .await?;
+        if record.namespace != *namespace || record.key != *key {
+            bail!("object metadata does not match requested object");
+        }
+        if record.deleted && version.is_none() {
+            bail!("object {namespace}/{key} is deleted");
+        }
+        Ok(record)
+    }
+
+    async fn delete_object(
+        &self,
+        namespace: &NamespaceId,
+        key: &ObjectKey,
+        expected_version: Option<ObjectVersion>,
+    ) -> Result<()> {
+        let _guard = self.object_lock.lock().await;
+        let current = self.get_object(namespace, key, None).await?;
+        if let Some(expected) = expected_version
+            && current.version != expected
+        {
+            bail!("object version condition failed for {namespace}/{key}");
+        }
+        let tombstone = ObjectRef {
+            deleted: true,
+            version: ObjectVersion::new(
+                current
+                    .version
+                    .get()
+                    .checked_add(1)
+                    .context("object version overflow")?,
+            ),
+            ..current
+        };
+        self.put_object_record(
+            Self::object_key(
+                namespace,
+                key,
+                &format!("versions/{}.json", tombstone.version.get()),
+            ),
+            &tombstone,
+        )
+        .await?;
+        self.put_object_record(Self::object_key(namespace, key, "current.json"), &tombstone)
+            .await
+    }
+
+    async fn list_objects(
+        &self,
+        namespace: &NamespaceId,
+        prefix: Option<&str>,
+    ) -> Result<Vec<ObjectRef>> {
+        if let Some(prefix) = prefix {
+            ObjectKey::validate_prefix(prefix)?;
+        }
+        let mut pager = self
+            .client
+            .objects()
+            .list_v2(&self.bucket)
+            .prefix(format!("objects/{namespace}/"))?
+            .pager();
+        let mut output = Vec::new();
+        while let Some(page) = pager.next_page().await? {
+            for item in page.contents {
+                if !item.key.ends_with("/current.json") {
+                    continue;
+                }
+                let Ok(value) = self.read_object_record(item.key).await else {
+                    continue;
+                };
+                if value.deleted || !value.namespace.eq(namespace) {
+                    continue;
+                }
+                if prefix.is_none_or(|wanted| value.key.as_str().starts_with(wanted)) {
+                    output.push(value);
+                }
+            }
+        }
+        output.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(output)
     }
 }
 
