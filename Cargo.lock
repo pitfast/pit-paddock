@@ -904,6 +904,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "libc",
  "pit-artifact",
  "pit-paddock-core",
  "serde_json",

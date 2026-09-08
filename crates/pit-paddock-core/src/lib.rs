@@ -152,6 +152,25 @@ impl ObjectVersion {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CasConflict {
+    pub expected: Option<ObjectVersion>,
+    pub actual: Option<ObjectVersion>,
+}
+
+impl std::fmt::Display for CasConflict {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "conditional object update conflicted: expected {:?}, actual {:?}",
+            self.expected.map(ObjectVersion::get),
+            self.actual.map(ObjectVersion::get)
+        )
+    }
+}
+
+impl std::error::Error for CasConflict {}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectMetadata {
     pub content_type: Option<String>,
@@ -187,6 +206,16 @@ pub struct PaddockGrant {
     pub write: bool,
     pub delete: bool,
     pub list: bool,
+}
+
+/// Host-owned inbound gateway credentials. The secret is carried only in the
+/// trusted request context and is never serialized into a guest artifact or
+/// exposed through the generic storage capability.
+#[derive(Clone)]
+pub struct PaddockGatewayAuth {
+    pub access_key: String,
+    pub secret_key: String,
+    pub region: String,
 }
 
 impl PaddockGrant {

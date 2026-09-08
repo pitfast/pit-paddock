@@ -5,9 +5,14 @@ edition.workspace = true
 license.workspace = true
 description = "Filesystem backend for PitFast Paddock"
 
+[features]
+default = []
+fault-injection = []
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+libc.workspace = true
 pit-artifact.workspace = true
 pit-paddock-core = { path = "../pit-paddock-core" }
 serde_json.workspace = true

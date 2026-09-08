@@ -1,5 +1,6 @@
 //! Atomic, content-addressed filesystem Paddock backend.
 
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,9 +9,9 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use pit_artifact::ArtifactManifest;
 use pit_paddock_core::{
-    ArtifactDigest, ArtifactName, BlobDigest, BlobPut, BlobSize, NamespaceId, ObjectKey,
-    ObjectMetadata, ObjectRef, ObjectVersion, ObjectWriter, PaddockBackend, PaddockCapabilities,
-    PaddockObjectBackend, PaddockRef, PaddockRefWire, ResolvedRef,
+    ArtifactDigest, ArtifactName, BlobDigest, BlobPut, BlobSize, CasConflict, NamespaceId,
+    ObjectKey, ObjectMetadata, ObjectRef, ObjectVersion, ObjectWriter, PaddockBackend,
+    PaddockCapabilities, PaddockObjectBackend, PaddockRef, PaddockRefWire, ResolvedRef,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
@@ -72,6 +73,15 @@ impl FilesystemPaddock {
         self.object_dir(namespace, key).join("current.json")
     }
 
+    fn object_lock_path(&self, namespace: &NamespaceId, key: &ObjectKey) -> PathBuf {
+        let mut path = self.root.join("locks/objects");
+        for part in namespace.as_str().split('/').chain(key.as_str().split('/')) {
+            path.push(part);
+        }
+        path.push(".lock");
+        path
+    }
+
     fn object_version_path(
         &self,
         namespace: &NamespaceId,
@@ -96,6 +106,41 @@ impl FilesystemPaddock {
         Ok(())
     }
 
+    async fn acquire_process_lock(
+        &self,
+        namespace: &NamespaceId,
+        key: &ObjectKey,
+    ) -> Result<ProcessLock> {
+        let path = self.object_lock_path(namespace, key);
+        let parent = path.parent().context("object lock has no parent")?;
+        Self::ensure_no_symlink(parent).await?;
+        tokio::fs::create_dir_all(parent).await?;
+        Self::ensure_no_symlink(parent).await?;
+        let lock = tokio::task::spawn_blocking(move || -> Result<ProcessLock> {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .with_context(|| format!("open object lock {}", path.display()))?;
+            // flock is kernel-managed: a process crash releases the lock, so
+            // no stale PID cleanup protocol is needed.
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if result != 0 {
+                bail!(
+                    "acquire object lock {}: {}",
+                    path.display(),
+                    std::io::Error::last_os_error()
+                );
+            }
+            Ok(ProcessLock { file })
+        })
+        .await
+        .context("object lock task failed")??;
+        Ok(lock)
+    }
+
     async fn read_object_record(&self, path: &Path) -> Result<ObjectRef> {
         let bytes = tokio::fs::read(path)
             .await
@@ -105,11 +150,14 @@ impl FilesystemPaddock {
 
     async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         let parent = path.parent().context("Paddock path has no parent")?;
+        Self::ensure_no_symlink(parent).await?;
         tokio::fs::create_dir_all(parent).await?;
+        Self::ensure_no_symlink(parent).await?;
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let temp = parent.join(format!(
-            ".{}.{}.tmp",
+            ".{}.{}.{}.tmp",
             path.file_name().unwrap().to_string_lossy(),
+            std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         let result = async {
@@ -119,8 +167,25 @@ impl FilesystemPaddock {
                 .open(&temp)
                 .await?;
             file.write_all(bytes).await?;
+            fault_point("after_temp_write");
             file.sync_all().await?;
             tokio::fs::rename(&temp, path).await?;
+            let file_name = path.file_name().and_then(|name| name.to_str());
+            if file_name == Some("current.json") {
+                fault_point("after_current_ref_rename");
+            } else if path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                == Some("versions")
+            {
+                fault_point("after_version_rename");
+            }
+            fault_point("before_directory_fsync");
+            Self::sync_directory(parent).await?;
+            if file_name == Some("current.json") {
+                fault_point("after_directory_fsync");
+            }
             Ok::<(), anyhow::Error>(())
         }
         .await;
@@ -136,7 +201,44 @@ impl FilesystemPaddock {
         tokio::fs::create_dir_all(parent).await?;
         Self::ensure_no_symlink(parent).await?;
         tokio::fs::rename(temp, path).await?;
+        fault_point("after_blob_rename");
+        Self::sync_directory(parent).await?;
         Ok(())
+    }
+
+    async fn sync_directory(path: &Path) -> Result<()> {
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let directory = std::fs::File::open(&path)
+                .with_context(|| format!("open directory {} for sync", path.display()))?;
+            directory
+                .sync_all()
+                .with_context(|| format!("sync directory {}", path.display()))
+        })
+        .await
+        .context("directory sync task failed")??;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+fn fault_point(name: &str) {
+    if std::env::var("PITFAST_FS_FAULT_POINT").ok().as_deref() == Some(name) {
+        eprintln!("fault injection: {name}");
+        std::process::exit(137);
+    }
+}
+
+#[cfg(not(feature = "fault-injection"))]
+fn fault_point(_name: &str) {}
+
+struct ProcessLock {
+    file: std::fs::File,
+}
+
+impl Drop for ProcessLock {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
@@ -183,14 +285,18 @@ impl ObjectWriter for FilesystemObjectWriter {
             .file
             .take()
             .context("object writer is already finalized")?;
+        fault_point("after_temp_write");
         file.sync_all().await?;
         drop(file);
+        let _process_lock = self
+            .backend
+            .acquire_process_lock(&self.namespace, &self.key)
+            .await?;
 
         let digest = BlobDigest::from_sha256_digest(self.hasher.clone().finalize().into());
         let expected_size = BlobSize::new(self.size);
         let blob_path = self.backend.generic_blob_path(&digest);
-        FilesystemPaddock::ensure_no_symlink(blob_path.parent().context("blob parent missing")?)
-            .await?;
+        FilesystemPaddock::ensure_no_symlink(&blob_path).await?;
         if tokio::fs::try_exists(&blob_path).await? {
             let existing = tokio::fs::read(&blob_path).await?;
             if BlobDigest::from_bytes(&existing) != digest || existing.len() as u64 != self.size {
@@ -202,19 +308,20 @@ impl ObjectWriter for FilesystemObjectWriter {
         }
 
         let current_path = self.backend.object_current_path(&self.namespace, &self.key);
-        let current = match self.backend.read_object_record(&current_path).await {
-            Ok(value) if !value.deleted => Some(value),
-            Ok(value) => Some(value),
-            Err(_) => None,
+        FilesystemPaddock::ensure_no_symlink(&current_path).await?;
+        let current = if tokio::fs::try_exists(&current_path).await? {
+            Some(self.backend.read_object_record(&current_path).await?)
+        } else {
+            None
         };
         if let Some(expected) = self.expected_version
             && Some(expected) != current.as_ref().map(|value| value.version)
         {
-            bail!(
-                "object version condition failed for {}/{}",
-                self.namespace,
-                self.key
-            );
+            return Err(CasConflict {
+                expected: Some(expected),
+                actual: current.as_ref().map(|value| value.version),
+            }
+            .into());
         }
         let version = match current.as_ref() {
             Some(value) => value
@@ -255,7 +362,9 @@ impl ObjectWriter for FilesystemObjectWriter {
 #[async_trait]
 impl PaddockBackend for FilesystemPaddock {
     async fn has_blob(&self, digest: &ArtifactDigest) -> Result<bool> {
-        Ok(tokio::fs::try_exists(self.blob_path(digest)).await?)
+        let path = self.blob_path(digest);
+        Self::ensure_no_symlink(&path).await?;
+        Ok(tokio::fs::try_exists(path).await?)
     }
 
     async fn put_blob(&self, digest: &ArtifactDigest, bytes: &[u8]) -> Result<BlobPut> {
@@ -263,6 +372,7 @@ impl PaddockBackend for FilesystemPaddock {
             bail!("blob bytes do not match digest {}", digest);
         }
         let path = self.blob_path(digest);
+        Self::ensure_no_symlink(&path).await?;
         if tokio::fs::try_exists(&path).await? {
             let existing = tokio::fs::read(&path).await?;
             if existing != bytes {
@@ -275,7 +385,9 @@ impl PaddockBackend for FilesystemPaddock {
     }
 
     async fn get_blob(&self, digest: &ArtifactDigest) -> Result<Vec<u8>> {
-        tokio::fs::read(self.blob_path(digest))
+        let path = self.blob_path(digest);
+        Self::ensure_no_symlink(&path).await?;
+        tokio::fs::read(path)
             .await
             .with_context(|| format!("blob {} is unavailable", digest))
     }
@@ -290,6 +402,7 @@ impl PaddockBackend for FilesystemPaddock {
         }
         let contents = manifest.to_json()?;
         let path = self.manifest_path(digest);
+        Self::ensure_no_symlink(&path).await?;
         if tokio::fs::try_exists(&path).await? {
             if tokio::fs::read(&path).await? != contents.as_bytes() {
                 bail!("immutable manifest {} has different metadata", digest);
@@ -300,7 +413,9 @@ impl PaddockBackend for FilesystemPaddock {
     }
 
     async fn get_manifest(&self, digest: &ArtifactDigest) -> Result<ArtifactManifest> {
-        let bytes = tokio::fs::read(self.manifest_path(digest))
+        let path = self.manifest_path(digest);
+        Self::ensure_no_symlink(&path).await?;
+        let bytes = tokio::fs::read(path)
             .await
             .with_context(|| format!("manifest for {} is unavailable", digest))?;
         let manifest = serde_json::from_slice(&bytes).context("malformed Paddock manifest")?;
@@ -325,7 +440,9 @@ impl PaddockBackend for FilesystemPaddock {
     }
 
     async fn resolve_ref(&self, reference: &PaddockRef) -> Result<ArtifactDigest> {
-        let bytes = tokio::fs::read(self.ref_path(reference))
+        let path = self.ref_path(reference);
+        Self::ensure_no_symlink(&path).await?;
+        let bytes = tokio::fs::read(path)
             .await
             .with_context(|| format!("ref {} is unavailable", reference))?;
         let resolved: ResolvedRef =
@@ -379,10 +496,7 @@ impl PaddockObjectBackend for FilesystemPaddock {
             range_read: true,
             streaming_write: true,
             atomic_ref_replace: true,
-            // The lock protects concurrent users of this backend handle. A
-            // cross-process CAS requires an OS file-lock primitive and is not
-            // advertised until it is implemented.
-            conditional_ref_update: false,
+            conditional_ref_update: true,
             durable_sync: true,
         }
     }
@@ -390,7 +504,7 @@ impl PaddockObjectBackend for FilesystemPaddock {
     async fn put_blob_bytes(&self, bytes: &[u8]) -> Result<(BlobDigest, BlobSize)> {
         let digest = BlobDigest::from_bytes(bytes);
         let path = self.generic_blob_path(&digest);
-        Self::ensure_no_symlink(path.parent().context("blob parent missing")?).await?;
+        Self::ensure_no_symlink(&path).await?;
         if tokio::fs::try_exists(&path).await? {
             let existing = tokio::fs::read(&path).await?;
             if BlobDigest::from_bytes(&existing) != digest {
@@ -404,6 +518,7 @@ impl PaddockObjectBackend for FilesystemPaddock {
 
     async fn get_blob_bytes(&self, digest: &BlobDigest) -> Result<Vec<u8>> {
         let path = self.generic_blob_path(digest);
+        Self::ensure_no_symlink(&path).await?;
         let bytes = tokio::fs::read(&path)
             .await
             .with_context(|| format!("blob {} is unavailable", digest))?;
@@ -420,6 +535,7 @@ impl PaddockObjectBackend for FilesystemPaddock {
         length: u64,
     ) -> Result<Vec<u8>> {
         let path = self.generic_blob_path(digest);
+        Self::ensure_no_symlink(&path).await?;
         let mut file = tokio::fs::File::open(&path)
             .await
             .with_context(|| format!("blob {} is unavailable", digest))?;
@@ -453,7 +569,8 @@ impl PaddockObjectBackend for FilesystemPaddock {
         Self::ensure_no_symlink(&temp_dir).await?;
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let temp = temp_dir.join(format!(
-            "object-{}.tmp",
+            "object-{}-{}.tmp",
+            std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         let file = tokio::fs::OpenOptions::new()
@@ -484,6 +601,7 @@ impl PaddockObjectBackend for FilesystemPaddock {
             Some(version) => self.object_version_path(namespace, key, version),
             None => self.object_current_path(namespace, key),
         };
+        Self::ensure_no_symlink(&path).await?;
         let record = self.read_object_record(&path).await?;
         if record.namespace != *namespace || record.key != *key {
             bail!("object metadata does not match requested object");
@@ -501,11 +619,16 @@ impl PaddockObjectBackend for FilesystemPaddock {
         expected_version: Option<ObjectVersion>,
     ) -> Result<()> {
         let _guard = self.object_lock.lock().await;
+        let _process_lock = self.acquire_process_lock(namespace, key).await?;
         let current = self.get_object(namespace, key, None).await?;
         if let Some(expected) = expected_version
             && current.version != expected
         {
-            bail!("object version condition failed for {namespace}/{key}");
+            return Err(CasConflict {
+                expected: Some(expected),
+                actual: Some(current.version),
+            }
+            .into());
         }
         let tombstone = ObjectRef {
             deleted: true,
@@ -557,6 +680,7 @@ impl PaddockObjectBackend for FilesystemPaddock {
                 if path.file_name().and_then(|value| value.to_str()) != Some("current.json") {
                     continue;
                 }
+                Self::ensure_no_symlink(&path).await?;
                 let value = self.read_object_record(&path).await?;
                 if value.deleted || !value.namespace.eq(namespace) {
                     continue;
