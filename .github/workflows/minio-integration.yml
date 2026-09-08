@@ -1,0 +1,56 @@
+name: Paddock MinIO integration
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - ".github/workflows/minio-integration.yml"
+
+jobs:
+  minio:
+    runs-on: ubuntu-latest
+    services:
+      minio:
+        image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+        ports:
+          - 9000:9000
+        env:
+          MINIO_ROOT_USER: pitfast-test
+          MINIO_ROOT_PASSWORD: pitfast-test-secret-123
+        options: >-
+          --health-cmd "curl -f http://localhost:9000/minio/health/live"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+        command: server /data --address :9000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: pitfast/pit-crew
+          path: pit-crew
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Create test bucket
+        run: |
+          curl --fail --retry 10 --retry-delay 1 -X PUT http://127.0.0.1:9000/pitfast-test
+      - name: Run real S3 backend tests
+        env:
+          PITFAST_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+          PITFAST_TEST_S3_BUCKET: pitfast-test
+          PITFAST_TEST_S3_ACCESS_KEY: pitfast-test
+          PITFAST_TEST_S3_SECRET_KEY: pitfast-test-secret-123
+        run: |
+          cargo test -p pit-paddock-s3 --test s3_objects_real -- --nocapture
+          cargo test -p pit-paddock-s3 --test s3_real -- --nocapture
+      - name: Validate and package gateway component
+        run: |
+          npm install --global @bytecodealliance/componentize-js@0.22.0
+          cargo install wasm-tools --version 1.240.0 --locked
+          gateway/package-gateway.sh gateway/dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paddock-s3-gateway
+          path: gateway/dist/*

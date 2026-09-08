@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "name": "paddock-s3-gateway",
+  "version": "0.1.0-alpha.1",
+  "artifact": "paddock-s3-gateway.wasm",
+  "artifact_sha256": "@ARTIFACT_SHA256@",
+  "artifact_size": @ARTIFACT_SIZE@,
+  "world": "wasi:http/proxy",
+  "required_capabilities": [
+    "pitfast:paddock/store@0.1.0",
+    "pitfast:paddock/auth@0.1.0"
+  ],
+  "protocol_subset": [
+    "PUT",
+    "GET",
+    "HEAD",
+    "DELETE",
+    "ListObjectsV2-style listing",
+    "single-range GET",
+    "header-based AWS SigV4"
+  ],
+  "canonical_artifact": true,
+  "derived_cwasm_distributed": false
+}

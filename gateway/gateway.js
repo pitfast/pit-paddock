@@ -7,8 +7,172 @@ import {
   ResponseOutparam,
 } from 'wasi:http/types@0.2.0';
 import * as store from 'pitfast:paddock/store@0.1.0';
+import * as auth from 'pitfast:paddock/auth@0.1.0';
 
 const namespace = 's3-alpha';
+const MAX_ERROR_BYTES = 4096;
+
+// Legacy signing helpers remain below as non-executed reference code. The
+// active verifier is host-owned so credentials never enter the guest module.
+const SHA256_K = new Uint32Array([
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b,
+  0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01,
+  0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7,
+  0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+  0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152,
+  0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+  0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+  0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819,
+  0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08,
+  0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f,
+  0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+  0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]);
+
+function rotr(value, bits) {
+  return (value >>> bits) | (value << (32 - bits));
+}
+
+function sha256(input) {
+  const bytes = input instanceof Uint8Array ? input : text(input);
+  const bitLength = bytes.length * 8;
+  const paddedLength = ((bytes.length + 9 + 63) >> 6) << 6;
+  const padded = new Uint8Array(paddedLength);
+  padded.set(bytes);
+  padded[bytes.length] = 0x80;
+  const view = new DataView(padded.buffer);
+  view.setUint32(paddedLength - 8, Math.floor(bitLength / 0x100000000));
+  view.setUint32(paddedLength - 4, bitLength >>> 0);
+  let h0 = 0x6a09e667; let h1 = 0xbb67ae85; let h2 = 0x3c6ef372;
+  let h3 = 0xa54ff53a; let h4 = 0x510e527f; let h5 = 0x9b05688c;
+  let h6 = 0x1f83d9ab; let h7 = 0x5be0cd19;
+  const w = new Uint32Array(64);
+  for (let offset = 0; offset < padded.length; offset += 64) {
+    for (let i = 0; i < 16; i++) w[i] = view.getUint32(offset + i * 4);
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+      const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+    }
+    let a = h0; let b = h1; let c = h2; let d = h3;
+    let e = h4; let f = h5; let g = h6; let h = h7;
+    for (let i = 0; i < 64; i++) {
+      const s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+      const ch = (e & f) ^ (~e & g);
+      const temp1 = (h + s1 + ch + SHA256_K[i] + w[i]) >>> 0;
+      const s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const temp2 = (s0 + maj) >>> 0;
+      h = g; g = f; f = e; e = (d + temp1) >>> 0;
+      d = c; c = b; b = a; a = (temp1 + temp2) >>> 0;
+    }
+    h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0;
+    h3 = (h3 + d) >>> 0; h4 = (h4 + e) >>> 0; h5 = (h5 + f) >>> 0;
+    h6 = (h6 + g) >>> 0; h7 = (h7 + h) >>> 0;
+  }
+  const output = new Uint8Array(32);
+  const result = [h0, h1, h2, h3, h4, h5, h6, h7];
+  result.forEach((value, index) => viewFor(output).setUint32(index * 4, value));
+  return output;
+}
+
+function viewFor(bytes) { return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength); }
+
+function hmacSha256(key, message) {
+  let actual = key instanceof Uint8Array ? key : text(key);
+  if (actual.length > 64) actual = sha256(actual);
+  const padded = new Uint8Array(64); padded.set(actual);
+  const inner = new Uint8Array(64); const outer = new Uint8Array(64);
+  for (let i = 0; i < 64; i++) { inner[i] = padded[i] ^ 0x36; outer[i] = padded[i] ^ 0x5c; }
+  const innerInput = new Uint8Array(inner.length + message.length);
+  innerInput.set(inner); innerInput.set(message, inner.length);
+  const outerInput = new Uint8Array(outer.length + 32);
+  outerInput.set(outer); outerInput.set(sha256(innerInput), outer.length);
+  return sha256(outerInput);
+}
+
+function hex(bytes) {
+  return Array.from(bytes, value => value.toString(16).padStart(2, '0')).join('');
+}
+
+function constantTimeEqual(left, right) {
+  if (left.length !== right.length) return false;
+  let difference = 0;
+  for (let i = 0; i < left.length; i++) difference |= left.charCodeAt(i) ^ right.charCodeAt(i);
+  return difference === 0;
+}
+
+function awsEncode(value) {
+  return encodeURIComponent(value).replace(/[!'()*]/g, character => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+function canonicalQuery(path) {
+  const query = path.indexOf('?');
+  if (query === -1) return '';
+  const pairs = path.slice(query + 1).split('&').filter(Boolean).map(part => {
+    const equal = part.indexOf('=');
+    const key = equal === -1 ? part : part.slice(0, equal);
+    const value = equal === -1 ? '' : part.slice(equal + 1);
+    return [awsEncode(decodeURIComponent(key)), awsEncode(decodeURIComponent(value))];
+  });
+  pairs.sort((a, b) => a[0] === b[0] ? a[1].localeCompare(b[1]) : a[0].localeCompare(b[0]));
+  return pairs.map(pair => `${pair[0]}=${pair[1]}`).join('&');
+}
+
+function canonicalUri(path) {
+  const raw = path.split('?', 1)[0] || '/';
+  return raw.split('/').map(segment => awsEncode(decodeURIComponent(segment))).join('/') || '/';
+}
+
+function headerEntries(headers) {
+  return headers.entries().map(([name, value]) => [name.toLowerCase(), new TextDecoder().decode(Uint8Array.from(value)).trim().replace(/\s+/g, ' ')]);
+}
+
+function authFailure(message) { return { status: 403, code: 'AccessDenied', message }; }
+
+function validateAuth(request, payloadHash) {
+  // Avoid touching the optional WASI environment capability for the normal
+  // unauthenticated alpha path. This also keeps the no-auth gateway hot path
+  // identical to earlier releases.
+  const authorization = firstHeaderValue(request.headers(), 'authorization');
+  if (authorization === null) return null;
+  const env = new Map();
+  const accessKey = env.get('PITFAST_S3_GATEWAY_ACCESS_KEY');
+  const secretKey = env.get('PITFAST_S3_GATEWAY_SECRET_KEY');
+  if (accessKey === undefined && secretKey === undefined) return null;
+  if (accessKey === undefined || secretKey === undefined) return authFailure('gateway authentication is misconfigured');
+  const date = firstHeaderValue(request.headers(), 'x-amz-date');
+  if (authorization === null || date === null) return authFailure('SigV4 Authorization and x-amz-date are required');
+  const match = /^AWS4-HMAC-SHA256 Credential=([^/]+)\/(\d{8})\/([^/]+)\/([^/]+)\/aws4_request, SignedHeaders=([^,]+), Signature=([0-9a-f]{64})$/.exec(authorization);
+  if (match === null || match[1] !== accessKey) return authFailure('invalid SigV4 credential');
+  if (!/^\d{8}T\d{6}Z$/.test(date)) return authFailure('invalid x-amz-date');
+  const year = Number(date.slice(0, 4)); const month = Number(date.slice(4, 6)) - 1;
+  const day = Number(date.slice(6, 8)); const hour = Number(date.slice(9, 11));
+  const minute = Number(date.slice(11, 13)); const second = Number(date.slice(13, 15));
+  const signedAt = Date.UTC(year, month, day, hour, minute, second) / 1000;
+  const now = Math.floor(Date.now() / 1000);
+  if (!Number.isFinite(signedAt) || Math.abs(now - signedAt) > 900) return authFailure('request timestamp is outside the 15 minute SigV4 window');
+  const signedHeaders = match[5].split(';');
+  if (!signedHeaders.includes('host') || !signedHeaders.includes('x-amz-date')) return authFailure('host and x-amz-date must be signed');
+  const entries = new Map(headerEntries(request.headers()));
+  const canonicalHeaders = signedHeaders.map(name => {
+    if (!entries.has(name)) throw authFailure(`signed header is missing: ${name}`);
+    return `${name}:${entries.get(name)}\n`;
+  }).join('');
+  const canonical = `${methodName(request)}\n${canonicalUri(request.pathWithQuery())}\n${canonicalQuery(request.pathWithQuery())}\n${canonicalHeaders}\n${signedHeaders.join(';')}\n${payloadHash}`;
+  const hashedCanonical = hex(sha256(text(canonical)));
+  const region = env.get('PITFAST_S3_GATEWAY_REGION') ?? 'us-east-1';
+  const scope = `${match[2]}/${match[3]}/${match[4]}/aws4_request`;
+  const stringToSign = `AWS4-HMAC-SHA256\n${date}\n${scope}\n${hashedCanonical}`;
+  const kDate = hmacSha256(text(`AWS4${secretKey}`), text(match[2]));
+  const kRegion = hmacSha256(kDate, text(region));
+  const kService = hmacSha256(kRegion, text(match[4]));
+  const signingKey = hmacSha256(kService, text('aws4_request'));
+  const expected = hex(hmacSha256(signingKey, text(stringToSign)));
+  if (!constantTimeEqual(expected, match[6])) return authFailure('signature does not match');
+  return null;
+}
 
 function response(status, body = new Uint8Array(), contentType = 'text/plain') {
   const headers = new Fields();
@@ -45,6 +209,7 @@ function text(value) {
 function streamBody(request, writer) {
   const body = request.consume();
   const input = body.stream();
+  let size = 0n;
   try {
     while (true) {
       const ready = input.subscribe();
@@ -59,6 +224,7 @@ function streamBody(request, writer) {
       }
       if (chunk.length === 0) continue;
       writer.write(chunk);
+      size += BigInt(chunk.length);
     }
   } finally {
     input[Symbol.dispose]();
@@ -68,6 +234,7 @@ function streamBody(request, writer) {
     trailersReady[Symbol.dispose]();
     trailers.get();
   }
+  return size;
 }
 
 function keyFromRequest(request) {
@@ -117,6 +284,15 @@ function firstHeaderValue(headers, name) {
   return new TextDecoder().decode(Uint8Array.from(first));
 }
 
+function xmlEscape(value) {
+  return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+}
+
+function s3Error(status, code, message) {
+  const body = `<Error><Code>${xmlEscape(code)}</Code><Message>${xmlEscape(message)}</Message></Error>`;
+  return response(status, text(body.slice(0, MAX_ERROR_BYTES)), 'application/xml');
+}
+
 export const incomingHandler = {
   handle(request, responseOutparam) {
     let result;
@@ -124,7 +300,16 @@ export const incomingHandler = {
       const key = keyFromRequest(request);
       const method = methodName(request);
       const query = queryFromRequest(request);
-      if (key === null && method === 'GET' && query.get('list-type') === '2') {
+      const declaredPayloadHash = firstHeaderValue(request.headers(), 'x-amz-content-sha256');
+      let authenticationError = null;
+      try {
+        auth.verify();
+      } catch (_) {
+        authenticationError = s3Error(403, 'AccessDenied', 'request authentication failed');
+      }
+      if (authenticationError !== null) {
+        result = authenticationError;
+      } else if (key === null && method === 'GET' && query.get('list-type') === '2') {
         const listed = store.listObjects(namespace, query.get('prefix'));
         result = response(200, text(JSON.stringify({
             name: namespace,
@@ -137,9 +322,15 @@ export const incomingHandler = {
         if (method === 'PUT') {
           const contentType = firstHeaderValue(request.headers(), 'content-type');
           const writer = store.beginWrite(namespace, key, contentType);
-          streamBody(request, writer);
+          const declaredLength = firstHeaderValue(request.headers(), 'content-length');
+          const written = streamBody(request, writer);
+          if (declaredLength !== null && (!/^\d+$/.test(declaredLength) || BigInt(declaredLength) !== written)) {
+            writer.abort();
+            result = s3Error(400, 'InvalidRequest', 'Content-Length does not match the request body');
+          } else {
           const committed = writer.commit();
           result = response(200, text(JSON.stringify(objectJson(committed)) + '\n'), 'application/json');
+          }
         } else if (method === 'GET' || method === 'HEAD') {
           let found;
           try {
@@ -148,7 +339,7 @@ export const incomingHandler = {
             found = null;
           }
           if (found === null) {
-            result = response(404, text('not found\n'));
+            result = s3Error(404, 'NoSuchKey', 'The specified key does not exist.');
           } else if (method === 'HEAD') {
             result = response(200, new Uint8Array(), found.contentType ?? 'application/octet-stream');
           } else {
@@ -158,13 +349,13 @@ export const incomingHandler = {
             if (range !== null) {
               const match = /^bytes=(\d+)-(\d*)$/.exec(range);
               if (match === null) {
-                result = response(416, text('invalid range\n'));
+                result = s3Error(416, 'InvalidRange', 'The requested range is not satisfiable.');
               } else {
                 offset = BigInt(match[1]);
                 const size = BigInt(found.size);
                 const end = match[2] === '' ? size - 1n : BigInt(match[2]);
                 if (size === 0n || offset > end || end >= size) {
-                  result = response(416, text('invalid range\n'));
+                  result = s3Error(416, 'InvalidRange', 'The requested range is not satisfiable.');
                 } else {
                   length = end - offset + 1n;
                 }
@@ -179,11 +370,11 @@ export const incomingHandler = {
           store.delete(namespace, key);
           result = response(204);
         } else {
-          result = response(405, text('method not allowed\n'));
+          result = s3Error(405, 'InvalidRequest', 'method not allowed');
         }
       }
     } catch (error) {
-      result = response(500, text(`gateway failure: ${errorText(error)}\n`));
+      result = s3Error(500, 'InternalError', errorText(error));
     }
     ResponseOutparam.set(responseOutparam, { tag: 'ok', val: result });
   },

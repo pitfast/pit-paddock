@@ -3,4 +3,5 @@ package wasi:http@0.2.0;
 world gateway {
     include proxy;
     import pitfast:paddock/store@0.1.0;
+    import pitfast:paddock/auth@0.1.0;
 }

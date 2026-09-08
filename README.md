@@ -35,8 +35,10 @@ The offline backend stores raw bytes and the canonical `pit-artifact`
 ```
 
 Blobs and refs are written through temporary files and atomic rename. Refs are
-published only after the blob and manifest exist. There is no automatic
-garbage collection.
+published only after the blob and manifest exist. Object publication uses a
+kernel-managed advisory lock per namespace/key, so CAS semantics hold across
+backend handles and independent processes sharing the same root. There is no
+automatic garbage collection.
 
 Generic objects use a separate namespace-aware layout and never replace the
 artifact layout:
@@ -53,9 +55,10 @@ Object writes stream to a temporary file, hash and size are finalized before
 publication, then the immutable blob and versioned ref are published with
 atomic renames. Range reads seek directly into the blob. A tombstone moves the
 current ref while retaining historical versions and bytes. The filesystem
-backend advertises durable writes and atomic ref replacement; conditional
-updates are checked for a shared backend handle but are not advertised as a
-cross-process CAS guarantee yet.
+backend fsyncs file and containing-directory barriers around publication and
+advertises durable writes, atomic ref replacement, and cross-process
+conditional updates. Fault-injection tests cover crashes before and after the
+authority rename.
 
 ## S3-compatible backend
 
@@ -63,7 +66,11 @@ cross-process CAS guarantee yet.
 host-side credentials. It is deliberately vendor-neutral and has no AWS,
 Cloudflare, R2, or MinIO-specific behavior. Configure the endpoint, bucket,
 region, and credential environment variables in the caller; secrets are never
-part of manifests, refs, fingerprints, or normal output.
+part of manifests, refs, fingerprints, or normal output. Real local MinIO
+integration tests exercise blob/object PUT, GET, range, metadata, refs,
+overwrite, tombstone, and restart behavior. Portable S3 conditional ref CAS
+is intentionally not advertised because a provider-neutral two-object update
+cannot be made atomic by a read-then-write sequence.
 
 ## CLI
 
@@ -91,11 +98,12 @@ explicit real S3-compatible test configuration is provided.
 
 The separate [`gateway/`](gateway/) workload is the inbound compatibility
 proof. It is a normal `wasi:http/proxy` component that imports only the generic
-Paddock capability and is intended to run through PitLane. Its alpha subset is
-object `PUT`, `GET`, `HEAD`, `DELETE`, prefix listing, and single-range reads.
-It has no resident guest server; each request executes and then ends. AWS
-authentication, bucket policies, multipart upload, and full S3 compatibility
-are intentionally not claimed.
+Paddock capability plus a host-owned authentication capability and is intended
+to run through PitLane. Its alpha subset is object `PUT`, `GET`, `HEAD`,
+`DELETE`, prefix listing, and single-range reads. Header-based AWS SigV4 is
+supported with a 15-minute clock-skew window; presigned URLs, multipart upload,
+bucket policies, and full S3 compatibility are intentionally not claimed. It
+has no resident guest server; each request executes and then ends.
 
 ## Object contract
 
