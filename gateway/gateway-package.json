@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "name": "paddock-s3-gateway",
-  "version": "0.1.0-alpha.1",
+  "version": "@VERSION@",
   "artifact": "paddock-s3-gateway.wasm",
   "artifact_sha256": "@ARTIFACT_SHA256@",
   "artifact_size": @ARTIFACT_SIZE@,

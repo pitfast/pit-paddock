@@ -13,6 +13,7 @@ artifact="$work_dir/$package_name/paddock-s3-gateway.wasm"
 artifact_sha=$(sha256sum "$artifact" | awk '{print $1}')
 artifact_size=$(wc -c < "$artifact" | tr -d ' ')
 sed \
+  -e "s/@VERSION@/$version/" \
   -e "s/@ARTIFACT_SHA256@/$artifact_sha/" \
   -e "s/@ARTIFACT_SIZE@/$artifact_size/" \
   "$(dirname "$0")/gateway-package.json" > "$work_dir/$package_name/release-manifest.json"
