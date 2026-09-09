@@ -152,6 +152,36 @@ impl ObjectVersion {
     }
 }
 
+/// Authority precondition for a new object publication.
+///
+/// `Unconditional` retains ordinary last-committed-writer-wins semantics.
+/// `Absent` and `Version` are conditional operations and must be enforced by
+/// the backend as part of the publication mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RefCondition {
+    Unconditional,
+    Absent,
+    Version(ObjectVersion),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendCapabilityUnsupported {
+    pub backend: String,
+    pub capability: &'static str,
+}
+
+impl std::fmt::Display for BackendCapabilityUnsupported {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "backend '{}' does not support required Paddock capability '{}'",
+            self.backend, self.capability
+        )
+    }
+}
+
+impl std::error::Error for BackendCapabilityUnsupported {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CasConflict {
     pub expected: Option<ObjectVersion>,
@@ -269,6 +299,29 @@ pub trait PaddockObjectBackend: Send + Sync {
         metadata: ObjectMetadata,
         expected_version: Option<ObjectVersion>,
     ) -> Result<Box<dyn ObjectWriter>>;
+
+    /// Begins an object write with an explicit authority condition. Existing
+    /// backends remain compatible for unconditional writes; conditional calls
+    /// must be overridden rather than emulated with read/check/blind-write.
+    async fn begin_conditional_object_write(
+        &self,
+        namespace: NamespaceId,
+        key: ObjectKey,
+        metadata: ObjectMetadata,
+        condition: RefCondition,
+    ) -> Result<Box<dyn ObjectWriter>> {
+        match condition {
+            RefCondition::Unconditional => {
+                self.begin_object_write(namespace, key, metadata, None)
+                    .await
+            }
+            RefCondition::Absent | RefCondition::Version(_) => Err(BackendCapabilityUnsupported {
+                backend: "unknown".into(),
+                capability: "conditional_ref_update",
+            }
+            .into()),
+        }
+    }
     async fn get_object(
         &self,
         namespace: &NamespaceId,
@@ -281,6 +334,26 @@ pub trait PaddockObjectBackend: Send + Sync {
         key: &ObjectKey,
         expected_version: Option<ObjectVersion>,
     ) -> Result<()>;
+
+    /// Deletes/tombstones only when the requested authority condition holds.
+    async fn delete_object_if(
+        &self,
+        namespace: &NamespaceId,
+        key: &ObjectKey,
+        condition: RefCondition,
+    ) -> Result<()> {
+        match condition {
+            RefCondition::Unconditional => self.delete_object(namespace, key, None).await,
+            RefCondition::Version(version) => {
+                self.delete_object(namespace, key, Some(version)).await
+            }
+            RefCondition::Absent => Err(BackendCapabilityUnsupported {
+                backend: "unknown".into(),
+                capability: "conditional_ref_update",
+            }
+            .into()),
+        }
+    }
     async fn list_objects(
         &self,
         namespace: &NamespaceId,
@@ -297,6 +370,21 @@ pub async fn put_object<B: PaddockObjectBackend + ?Sized>(
 ) -> Result<ObjectRef> {
     let mut writer = backend
         .begin_object_write(namespace, key, metadata, None)
+        .await?;
+    writer.write_chunk(bytes).await?;
+    writer.commit().await
+}
+
+pub async fn put_object_if<B: PaddockObjectBackend + ?Sized>(
+    backend: &B,
+    namespace: NamespaceId,
+    key: ObjectKey,
+    metadata: ObjectMetadata,
+    condition: RefCondition,
+    bytes: &[u8],
+) -> Result<ObjectRef> {
+    let mut writer = backend
+        .begin_conditional_object_write(namespace, key, metadata, condition)
         .await?;
     writer.write_chunk(bytes).await?;
     writer.commit().await

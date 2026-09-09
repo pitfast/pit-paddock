@@ -9,9 +9,10 @@ use bytes::Bytes;
 use futures_util::stream;
 use pit_artifact::ArtifactManifest;
 use pit_paddock_core::{
-    ArtifactDigest, ArtifactName, BlobDigest, BlobPut, BlobSize, NamespaceId, ObjectKey,
-    ObjectMetadata, ObjectRef, ObjectVersion, ObjectWriter, PaddockBackend, PaddockCapabilities,
-    PaddockObjectBackend, PaddockRef, PaddockRefWire, ResolvedRef,
+    ArtifactDigest, ArtifactName, BackendCapabilityUnsupported, BlobDigest, BlobPut, BlobSize,
+    CasConflict, NamespaceId, ObjectKey, ObjectMetadata, ObjectRef, ObjectVersion, ObjectWriter,
+    PaddockBackend, PaddockCapabilities, PaddockObjectBackend, PaddockRef, PaddockRefWire,
+    RefCondition, ResolvedRef,
 };
 use s3::{AddressingStyle, Auth, Client, Credentials};
 use sha2::{Digest, Sha256};
@@ -25,6 +26,10 @@ pub struct S3PaddockConfig {
     pub access_key_env: String,
     pub secret_key_env: String,
     pub session_token_env: Option<String>,
+    /// Unknown S3-compatible endpoints default to false. Enabling this is an
+    /// explicit provider profile declaration that If-Match/If-None-Match on
+    /// the ref object is supported atomically.
+    pub conditional_ref_update: bool,
 }
 
 #[derive(Clone)]
@@ -32,6 +37,7 @@ pub struct S3Paddock {
     client: Arc<Client>,
     bucket: String,
     object_lock: Arc<tokio::sync::Mutex<()>>,
+    conditional_ref_update: bool,
 }
 
 fn is_not_found(error: &anyhow::Error) -> bool {
@@ -76,6 +82,7 @@ impl S3Paddock {
             client: Arc::new(client),
             bucket: config.bucket,
             object_lock: Arc::new(tokio::sync::Mutex::new(())),
+            conditional_ref_update: config.conditional_ref_update,
         })
     }
 
@@ -97,35 +104,84 @@ impl S3Paddock {
         format!("objects/{namespace}/{key}/{suffix}")
     }
 
-    async fn read_object_record(&self, key: String) -> Result<ObjectRef> {
-        let bytes = self
-            .client
-            .objects()
-            .get(&self.bucket, key)
-            .send()
-            .await?
-            .bytes()
-            .await?;
-        serde_json::from_slice(&bytes).context("malformed remote Paddock object ref")
+    async fn read_object_record_with_etag(
+        &self,
+        key: String,
+    ) -> Result<(ObjectRef, Option<String>)> {
+        let output = self.client.objects().get(&self.bucket, key).send().await?;
+        let etag = output.etag.clone();
+        let bytes = output.bytes().await?;
+        Ok((
+            serde_json::from_slice(&bytes).context("malformed remote Paddock object ref")?,
+            etag,
+        ))
     }
 
-    async fn read_optional_object_record(&self, key: String) -> Result<Option<ObjectRef>> {
-        match self.read_object_record(key).await {
+    async fn read_object_record(&self, key: String) -> Result<ObjectRef> {
+        Ok(self.read_object_record_with_etag(key).await?.0)
+    }
+
+    async fn read_optional_object_record(
+        &self,
+        key: String,
+    ) -> Result<Option<(ObjectRef, Option<String>)>> {
+        match self.read_object_record_with_etag(key).await {
             Ok(value) => Ok(Some(value)),
             Err(error) if is_not_found(&error) => Ok(None),
             Err(error) => Err(error),
         }
     }
 
-    async fn put_object_record(&self, key: String, value: &ObjectRef) -> Result<()> {
-        self.client
+    async fn put_object_record(
+        &self,
+        key: String,
+        value: &ObjectRef,
+        if_match: Option<&str>,
+        if_none_match: bool,
+    ) -> Result<()> {
+        let mut request = self
+            .client
             .objects()
             .put(&self.bucket, key)
             .body_bytes(serde_json::to_vec(value)?)
-            .content_type("application/json")?
-            .send()
-            .await?;
+            .content_type("application/json")?;
+        if let Some(etag) = if_match {
+            request = request.if_match(etag)?;
+        } else if if_none_match {
+            request = request.if_none_match("*")?;
+        }
+        request.send().await?;
         Ok(())
+    }
+
+    fn unsupported_conditional_refs() -> anyhow::Error {
+        BackendCapabilityUnsupported {
+            backend: "s3-compatible".into(),
+            capability: "conditional_ref_update",
+        }
+        .into()
+    }
+
+    fn is_precondition_failure(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            cause.downcast_ref::<s3::Error>().is_some_and(|remote| {
+                remote
+                    .status()
+                    .is_some_and(|status| matches!(status.as_u16(), 409 | 412))
+            })
+        })
+    }
+
+    async fn current_version(
+        &self,
+        namespace: &NamespaceId,
+        key: &ObjectKey,
+    ) -> Option<ObjectVersion> {
+        self.read_optional_object_record(Self::object_key(namespace, key, "current.json"))
+            .await
+            .ok()
+            .flatten()
+            .map(|(record, _)| record.version)
     }
 
     async fn object_exists(&self, key: String) -> Result<bool> {
@@ -148,7 +204,7 @@ struct S3ObjectWriter {
     namespace: NamespaceId,
     key: ObjectKey,
     metadata: ObjectMetadata,
-    expected_version: Option<ObjectVersion>,
+    condition: RefCondition,
     temp: std::path::PathBuf,
     file: Option<tokio::fs::File>,
     hasher: Sha256,
@@ -215,16 +271,32 @@ impl ObjectWriter for S3ObjectWriter {
             .backend
             .read_optional_object_record(current_key.clone())
             .await?;
-        if let Some(expected) = self.expected_version
-            && Some(expected) != current.as_ref().map(|value| value.version)
-        {
-            bail!(
-                "object version condition failed for {}/{}",
-                self.namespace,
-                self.key
-            );
+        let current_record = current.as_ref().map(|(value, _)| value);
+        let current_etag = current.as_ref().and_then(|(_, etag)| etag.as_deref());
+        match self.condition {
+            RefCondition::Unconditional => {}
+            RefCondition::Absent if current_record.is_some() => {
+                return Err(CasConflict {
+                    expected: None,
+                    actual: current_record.map(|value| value.version),
+                }
+                .into());
+            }
+            RefCondition::Absent => {}
+            RefCondition::Version(expected) => {
+                if Some(expected) != current_record.map(|value| value.version) {
+                    return Err(CasConflict {
+                        expected: Some(expected),
+                        actual: current_record.map(|value| value.version),
+                    }
+                    .into());
+                }
+                if current_etag.is_none() {
+                    return Err(S3Paddock::unsupported_conditional_refs());
+                }
+            }
         }
-        let version = match current.as_ref() {
+        let version = match current_record {
             Some(value) => value
                 .version
                 .get()
@@ -241,17 +313,75 @@ impl ObjectWriter for S3ObjectWriter {
             metadata: self.metadata.clone(),
             deleted: false,
         };
-        self.backend
-            .put_object_record(
-                S3Paddock::object_key(
-                    &self.namespace,
-                    &self.key,
-                    &format!("versions/{}.json", version),
-                ),
-                &record,
-            )
-            .await?;
-        self.backend.put_object_record(current_key, &record).await?;
+        let version_key = S3Paddock::object_key(
+            &self.namespace,
+            &self.key,
+            &format!("versions/{}.json", version),
+        );
+        match self.condition {
+            RefCondition::Unconditional => {
+                self.backend
+                    .put_object_record(version_key, &record, None, false)
+                    .await?;
+                self.backend
+                    .put_object_record(current_key, &record, None, false)
+                    .await?;
+            }
+            RefCondition::Absent | RefCondition::Version(_) => {
+                match self
+                    .backend
+                    .put_object_record(version_key.clone(), &record, None, true)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(error) if S3Paddock::is_precondition_failure(&error) => {
+                        let existing = self.backend.read_object_record(version_key).await?;
+                        if existing != record {
+                            return Err(CasConflict {
+                                expected: match self.condition {
+                                    RefCondition::Absent => None,
+                                    RefCondition::Version(expected) => Some(expected),
+                                    RefCondition::Unconditional => None,
+                                },
+                                actual: current_record.map(|value| value.version),
+                            }
+                            .into());
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+                let result = match self.condition {
+                    RefCondition::Absent => {
+                        self.backend
+                            .put_object_record(current_key, &record, None, true)
+                            .await
+                    }
+                    RefCondition::Version(_) => {
+                        self.backend
+                            .put_object_record(current_key, &record, current_etag, false)
+                            .await
+                    }
+                    RefCondition::Unconditional => unreachable!(),
+                };
+                if let Err(error) = result {
+                    if S3Paddock::is_precondition_failure(&error) {
+                        return Err(CasConflict {
+                            expected: match self.condition {
+                                RefCondition::Absent => None,
+                                RefCondition::Version(expected) => Some(expected),
+                                RefCondition::Unconditional => None,
+                            },
+                            actual: self
+                                .backend
+                                .current_version(&self.namespace, &self.key)
+                                .await,
+                        }
+                        .into());
+                    }
+                    return Err(error);
+                }
+            }
+        }
         Ok(record)
     }
 
@@ -421,10 +551,9 @@ impl PaddockObjectBackend for S3Paddock {
         PaddockCapabilities {
             range_read: true,
             streaming_write: true,
-            // Version metadata and the current pointer are separate S3
-            // objects. The SDK has no portable conditional pointer
-            // publication primitive, so cross-process CAS is not advertised.
-            conditional_ref_update: false,
+            // This is true only for an explicitly configured provider profile
+            // whose conditional PUT behavior has been tested/accepted.
+            conditional_ref_update: self.conditional_ref_update,
             atomic_ref_replace: false,
             durable_sync: true,
         }
@@ -505,30 +634,31 @@ impl PaddockObjectBackend for S3Paddock {
         metadata: ObjectMetadata,
         expected_version: Option<ObjectVersion>,
     ) -> Result<Box<dyn ObjectWriter>> {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let temp = std::env::temp_dir().join(format!(
-            "pit-paddock-s3-object-{}-{}.tmp",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .await?;
-        Ok(Box::new(S3ObjectWriter {
-            backend: self.clone(),
+        if expected_version.is_some() && !self.conditional_ref_update {
+            return Err(Self::unsupported_conditional_refs());
+        }
+        self.begin_object_write_with_condition(
             namespace,
             key,
             metadata,
-            expected_version,
-            temp,
-            file: Some(file),
-            hasher: Sha256::new(),
-            size: 0,
-        }))
+            expected_version.map_or(RefCondition::Unconditional, RefCondition::Version),
+        )
+        .await
     }
 
+    async fn begin_conditional_object_write(
+        &self,
+        namespace: NamespaceId,
+        key: ObjectKey,
+        metadata: ObjectMetadata,
+        condition: RefCondition,
+    ) -> Result<Box<dyn ObjectWriter>> {
+        if !self.conditional_ref_update && condition != RefCondition::Unconditional {
+            return Err(Self::unsupported_conditional_refs());
+        }
+        self.begin_object_write_with_condition(namespace, key, metadata, condition)
+            .await
+    }
     async fn get_object(
         &self,
         namespace: &NamespaceId,
@@ -557,12 +687,28 @@ impl PaddockObjectBackend for S3Paddock {
         key: &ObjectKey,
         expected_version: Option<ObjectVersion>,
     ) -> Result<()> {
+        if expected_version.is_some() && !self.conditional_ref_update {
+            return Err(Self::unsupported_conditional_refs());
+        }
         let _guard = self.object_lock.lock().await;
-        let current = self.get_object(namespace, key, None).await?;
+        let current_key = Self::object_key(namespace, key, "current.json");
+        let Some((current, current_etag)) = self
+            .read_optional_object_record(current_key.clone())
+            .await?
+        else {
+            bail!("object {namespace}/{key} is unavailable");
+        };
+        if current.deleted {
+            bail!("object {namespace}/{key} is deleted");
+        }
         if let Some(expected) = expected_version
             && current.version != expected
         {
-            bail!("object version condition failed for {namespace}/{key}");
+            return Err(CasConflict {
+                expected: Some(expected),
+                actual: Some(current.version),
+            }
+            .into());
         }
         let tombstone = ObjectRef {
             deleted: true,
@@ -575,17 +721,37 @@ impl PaddockObjectBackend for S3Paddock {
             ),
             ..current
         };
-        self.put_object_record(
-            Self::object_key(
-                namespace,
-                key,
-                &format!("versions/{}.json", tombstone.version.get()),
-            ),
-            &tombstone,
-        )
-        .await?;
-        self.put_object_record(Self::object_key(namespace, key, "current.json"), &tombstone)
-            .await
+        let version_key = Self::object_key(
+            namespace,
+            key,
+            &format!("versions/{}.json", tombstone.version.get()),
+        );
+        if let Some(expected) = expected_version {
+            self.put_object_record(version_key, &tombstone, None, true)
+                .await?;
+            let etag = current_etag
+                .as_deref()
+                .ok_or_else(Self::unsupported_conditional_refs)?;
+            if let Err(error) = self
+                .put_object_record(current_key, &tombstone, Some(etag), false)
+                .await
+            {
+                if Self::is_precondition_failure(&error) {
+                    return Err(CasConflict {
+                        expected: Some(expected),
+                        actual: self.current_version(namespace, key).await,
+                    }
+                    .into());
+                }
+                return Err(error);
+            }
+            Ok(())
+        } else {
+            self.put_object_record(version_key, &tombstone, None, false)
+                .await?;
+            self.put_object_record(current_key, &tombstone, None, false)
+                .await
+        }
     }
 
     async fn list_objects(
@@ -624,6 +790,39 @@ impl PaddockObjectBackend for S3Paddock {
     }
 }
 
+impl S3Paddock {
+    async fn begin_object_write_with_condition(
+        &self,
+        namespace: NamespaceId,
+        key: ObjectKey,
+        metadata: ObjectMetadata,
+        condition: RefCondition,
+    ) -> Result<Box<dyn ObjectWriter>> {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let temp = std::env::temp_dir().join(format!(
+            "pit-paddock-s3-object-{}-{}.tmp",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .await?;
+        Ok(Box::new(S3ObjectWriter {
+            backend: self.clone(),
+            namespace,
+            key,
+            metadata,
+            condition,
+            temp,
+            file: Some(file),
+            hasher: Sha256::new(),
+            size: 0,
+        }))
+    }
+}
+
 pub fn redact_config(config: &S3PaddockConfig) -> String {
     format!(
         "endpoint={}, bucket={}, region={}, credentials=redacted",
@@ -658,6 +857,7 @@ mod tests {
             access_key_env: "PIT_ACCESS".into(),
             secret_key_env: "PIT_SECRET".into(),
             session_token_env: None,
+            conditional_ref_update: false,
         };
         let redacted = redact_config(&config);
         assert!(redacted.contains("credentials=redacted"));

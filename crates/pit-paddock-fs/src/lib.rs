@@ -11,7 +11,8 @@ use pit_artifact::ArtifactManifest;
 use pit_paddock_core::{
     ArtifactDigest, ArtifactName, BlobDigest, BlobPut, BlobSize, CasConflict, NamespaceId,
     ObjectKey, ObjectMetadata, ObjectRef, ObjectVersion, ObjectWriter, PaddockBackend,
-    PaddockCapabilities, PaddockObjectBackend, PaddockRef, PaddockRefWire, ResolvedRef,
+    PaddockCapabilities, PaddockObjectBackend, PaddockRef, PaddockRefWire, RefCondition,
+    ResolvedRef,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
@@ -247,7 +248,7 @@ struct FilesystemObjectWriter {
     namespace: NamespaceId,
     key: ObjectKey,
     metadata: ObjectMetadata,
-    expected_version: Option<ObjectVersion>,
+    condition: RefCondition,
     temp: PathBuf,
     file: Option<tokio::fs::File>,
     hasher: Sha256,
@@ -314,14 +315,25 @@ impl ObjectWriter for FilesystemObjectWriter {
         } else {
             None
         };
-        if let Some(expected) = self.expected_version
-            && Some(expected) != current.as_ref().map(|value| value.version)
-        {
-            return Err(CasConflict {
-                expected: Some(expected),
-                actual: current.as_ref().map(|value| value.version),
+        match self.condition {
+            RefCondition::Unconditional => {}
+            RefCondition::Absent if current.is_some() => {
+                return Err(CasConflict {
+                    expected: None,
+                    actual: current.as_ref().map(|value| value.version),
+                }
+                .into());
             }
-            .into());
+            RefCondition::Absent => {}
+            RefCondition::Version(expected) => {
+                if Some(expected) != current.as_ref().map(|value| value.version) {
+                    return Err(CasConflict {
+                        expected: Some(expected),
+                        actual: current.as_ref().map(|value| value.version),
+                    }
+                    .into());
+                }
+            }
         }
         let version = match current.as_ref() {
             Some(value) => value
@@ -559,38 +571,25 @@ impl PaddockObjectBackend for FilesystemPaddock {
         metadata: ObjectMetadata,
         expected_version: Option<ObjectVersion>,
     ) -> Result<Box<dyn ObjectWriter>> {
-        let dir = self.object_dir(&namespace, &key);
-        Self::ensure_no_symlink(&dir).await?;
-        tokio::fs::create_dir_all(&dir).await?;
-        Self::ensure_no_symlink(&dir).await?;
-        let temp_dir = self.root.join("objects/.tmp");
-        Self::ensure_no_symlink(&temp_dir).await?;
-        tokio::fs::create_dir_all(&temp_dir).await?;
-        Self::ensure_no_symlink(&temp_dir).await?;
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let temp = temp_dir.join(format!(
-            "object-{}-{}.tmp",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .await?;
-        Ok(Box::new(FilesystemObjectWriter {
-            backend: self.clone(),
+        self.begin_object_write_with_condition(
             namespace,
             key,
             metadata,
-            expected_version,
-            temp,
-            file: Some(file),
-            hasher: Sha256::new(),
-            size: 0,
-        }))
+            expected_version.map_or(RefCondition::Unconditional, RefCondition::Version),
+        )
+        .await
     }
 
+    async fn begin_conditional_object_write(
+        &self,
+        namespace: NamespaceId,
+        key: ObjectKey,
+        metadata: ObjectMetadata,
+        condition: RefCondition,
+    ) -> Result<Box<dyn ObjectWriter>> {
+        self.begin_object_write_with_condition(namespace, key, metadata, condition)
+            .await
+    }
     async fn get_object(
         &self,
         namespace: &NamespaceId,
@@ -695,6 +694,47 @@ impl PaddockObjectBackend for FilesystemPaddock {
     }
 }
 
+impl FilesystemPaddock {
+    async fn begin_object_write_with_condition(
+        &self,
+        namespace: NamespaceId,
+        key: ObjectKey,
+        metadata: ObjectMetadata,
+        condition: RefCondition,
+    ) -> Result<Box<dyn ObjectWriter>> {
+        let dir = self.object_dir(&namespace, &key);
+        Self::ensure_no_symlink(&dir).await?;
+        tokio::fs::create_dir_all(&dir).await?;
+        Self::ensure_no_symlink(&dir).await?;
+        let temp_dir = self.root.join("objects/.tmp");
+        Self::ensure_no_symlink(&temp_dir).await?;
+        tokio::fs::create_dir_all(&temp_dir).await?;
+        Self::ensure_no_symlink(&temp_dir).await?;
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let temp = temp_dir.join(format!(
+            "object-{}-{}.tmp",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .await?;
+        Ok(Box::new(FilesystemObjectWriter {
+            backend: self.clone(),
+            namespace,
+            key,
+            metadata,
+            condition,
+            temp,
+            file: Some(file),
+            hasher: Sha256::new(),
+            size: 0,
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -704,7 +744,7 @@ mod tests {
     };
     use pit_paddock_core::{
         NamespaceId, ObjectKey, ObjectMetadata, ObjectVersion, PaddockBackend,
-        PaddockObjectBackend, pull, push, put_object,
+        PaddockObjectBackend, RefCondition, pull, push, put_object, put_object_if,
     };
 
     fn manifest(bytes: &[u8]) -> ArtifactManifest {
@@ -850,6 +890,75 @@ mod tests {
             store.get_object(&namespace, &key, None).await.unwrap(),
             first
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_authority_conditions_cover_create_update_and_tombstone() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = FilesystemPaddock::new(temp.path());
+        let namespace = NamespaceId::new("tenant-a").unwrap();
+        let key = ObjectKey::new("authority").unwrap();
+
+        let first = put_object_if(
+            &store,
+            namespace.clone(),
+            key.clone(),
+            ObjectMetadata::default(),
+            RefCondition::Absent,
+            b"one",
+        )
+        .await
+        .unwrap();
+        let absent_conflict = put_object_if(
+            &store,
+            namespace.clone(),
+            key.clone(),
+            ObjectMetadata::default(),
+            RefCondition::Absent,
+            b"other",
+        )
+        .await;
+        assert!(
+            absent_conflict
+                .unwrap_err()
+                .downcast_ref::<pit_paddock_core::CasConflict>()
+                .is_some()
+        );
+
+        let second = put_object_if(
+            &store,
+            namespace.clone(),
+            key.clone(),
+            ObjectMetadata::default(),
+            RefCondition::Version(first.version),
+            b"two",
+        )
+        .await
+        .unwrap();
+        let stale = put_object_if(
+            &store,
+            namespace.clone(),
+            key.clone(),
+            ObjectMetadata::default(),
+            RefCondition::Version(first.version),
+            b"stale",
+        )
+        .await;
+        assert!(
+            stale
+                .unwrap_err()
+                .downcast_ref::<pit_paddock_core::CasConflict>()
+                .is_some()
+        );
+
+        store
+            .delete_object_if(&namespace, &key, RefCondition::Version(second.version))
+            .await
+            .unwrap();
+        let stale_delete = store
+            .delete_object_if(&namespace, &key, RefCondition::Version(second.version))
+            .await;
+        assert!(stale_delete.is_err());
     }
 
     #[tokio::test]

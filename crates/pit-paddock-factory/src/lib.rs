@@ -37,6 +37,8 @@ pub enum NamedPaddockConfig {
         secret_key_env: String,
         #[serde(default)]
         session_token_env: Option<String>,
+        #[serde(default)]
+        conditional_ref_update: bool,
     },
 }
 
@@ -109,6 +111,7 @@ impl PaddockConfig {
                 access_key_env,
                 secret_key_env,
                 session_token_env,
+                conditional_ref_update,
             } => Ok(Arc::new(S3Paddock::from_config(S3PaddockConfig {
                 endpoint: endpoint.clone(),
                 bucket: bucket.clone(),
@@ -116,6 +119,7 @@ impl PaddockConfig {
                 access_key_env: access_key_env.clone(),
                 secret_key_env: secret_key_env.clone(),
                 session_token_env: session_token_env.clone(),
+                conditional_ref_update: *conditional_ref_update,
             })?)),
         }
     }
@@ -147,6 +151,7 @@ impl PaddockConfig {
                 access_key_env,
                 secret_key_env,
                 session_token_env,
+                conditional_ref_update,
             } => Ok(Arc::new(S3Paddock::from_config(S3PaddockConfig {
                 endpoint: endpoint.clone(),
                 bucket: bucket.clone(),
@@ -154,6 +159,7 @@ impl PaddockConfig {
                 access_key_env: access_key_env.clone(),
                 secret_key_env: secret_key_env.clone(),
                 session_token_env: session_token_env.clone(),
+                conditional_ref_update: *conditional_ref_update,
             })?)),
         }
     }

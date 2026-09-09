@@ -12,6 +12,8 @@ fn open_store() -> S3Paddock {
         access_key_env: "PITFAST_TEST_S3_ACCESS_KEY".into(),
         secret_key_env: "PITFAST_TEST_S3_SECRET_KEY".into(),
         session_token_env: None,
+        conditional_ref_update: std::env::var("PITFAST_TEST_S3_CONDITIONAL_REFS")
+            .is_ok_and(|value| value == "1"),
     })
     .unwrap()
 }
@@ -125,6 +127,7 @@ async fn backend_does_not_turn_network_failure_into_an_upload() {
         access_key_env: "PITFAST_TEST_S3_ACCESS_KEY".into(),
         secret_key_env: "PITFAST_TEST_S3_SECRET_KEY".into(),
         session_token_env: None,
+        conditional_ref_update: false,
     };
     let store = S3Paddock::from_config(config).unwrap();
     let error = store

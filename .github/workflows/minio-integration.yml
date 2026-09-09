@@ -50,6 +50,7 @@ jobs:
           PITFAST_TEST_S3_BUCKET: pitfast-test
           PITFAST_TEST_S3_ACCESS_KEY: pitfast-test
           PITFAST_TEST_S3_SECRET_KEY: pitfast-test-secret-123
+          PITFAST_TEST_S3_CONDITIONAL_REFS: "1"
         run: |
           cargo test -p pit-paddock-s3 --test s3_objects_real -- --nocapture
           cargo test -p pit-paddock-s3 --test s3_real -- --nocapture

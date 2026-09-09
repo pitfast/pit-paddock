@@ -26,6 +26,8 @@ async fn real_s3_roundtrip_when_configured() {
         access_key_env: "PITFAST_TEST_S3_ACCESS_KEY".into(),
         secret_key_env: "PITFAST_TEST_S3_SECRET_KEY".into(),
         session_token_env: None,
+        conditional_ref_update: std::env::var("PITFAST_TEST_S3_CONDITIONAL_REFS")
+            .is_ok_and(|value| value == "1"),
     })
     .unwrap();
     let bytes = b"\0asm\x01\0\0\0";
