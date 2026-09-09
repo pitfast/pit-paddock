@@ -17,6 +17,7 @@ sed \
   -e "s/@ARTIFACT_SHA256@/$artifact_sha/" \
   -e "s/@ARTIFACT_SIZE@/$artifact_size/" \
   "$(dirname "$0")/gateway-package.json" > "$work_dir/$package_name/release-manifest.json"
-tar -C "$work_dir" -czf "$output_dir/$package_name.tar.gz" "$package_name"
-sha256sum "$output_dir/$package_name.tar.gz" > "$output_dir/$package_name.tar.gz.sha256"
-echo "$output_dir/$package_name.tar.gz"
+archive="$output_dir/$package_name.tar.gz"
+tar -C "$work_dir" -czf "$archive" "$package_name"
+(cd "$output_dir" && sha256sum "$package_name.tar.gz" > "$package_name.tar.gz.sha256")
+echo "$archive"
