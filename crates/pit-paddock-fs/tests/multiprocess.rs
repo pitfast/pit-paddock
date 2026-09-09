@@ -137,51 +137,53 @@ async fn cross_process_unconditional_writes_never_corrupt_current_ref() -> Resul
 #[cfg(feature = "fault-injection")]
 #[tokio::test]
 async fn abrupt_publication_exit_leaves_coherent_authority() -> Result<()> {
-    for fault in [
-        "after_temp_write",
-        "after_blob_rename",
-        "after_version_rename",
-        "after_current_ref_rename",
-        "before_directory_fsync",
-        "after_directory_fsync",
-    ] {
-        let root = tempfile::tempdir()?;
-        let store = FilesystemPaddock::new(root.path());
-        let namespace = NamespaceId::new("test")?;
-        let key = ObjectKey::new("shared")?;
-        let initial = put_object(
-            &store,
-            namespace.clone(),
-            key.clone(),
-            ObjectMetadata::default(),
-            b"initial",
-        )
-        .await?;
-        let exe = std::env::current_exe()?;
-        let mut child = Command::new(&exe)
-            .args(["--exact", "cas_worker", "--nocapture"])
-            .env(WORKER_ROOT, root.path())
-            .env(WORKER_BODY, "after-crash")
-            .env(WORKER_EXPECTED, initial.version.get().to_string())
-            .env(WORKER_FAULT, fault)
-            .spawn()?;
-        let status = child.wait()?;
-        assert_eq!(
-            status.code(),
-            Some(137),
-            "fault {fault} did not abort: {status}"
-        );
-        let current = store.get_object(&namespace, &key, None).await?;
-        assert!(current.version.get() == 1 || current.version.get() == 2);
-        let bytes = store.get_blob_bytes(&current.digest).await?;
-        assert!(bytes == b"initial" || bytes == b"after-crash");
-        assert_eq!(
-            store
-                .get_object(&namespace, &key, Some(initial.version))
-                .await?
-                .version,
-            initial.version
-        );
+    for iteration in 0..100 {
+        for fault in [
+            "after_temp_write",
+            "after_blob_rename",
+            "after_version_rename",
+            "after_current_ref_rename",
+            "before_directory_fsync",
+            "after_directory_fsync",
+        ] {
+            let root = tempfile::tempdir()?;
+            let store = FilesystemPaddock::new(root.path());
+            let namespace = NamespaceId::new("test")?;
+            let key = ObjectKey::new("shared")?;
+            let initial = put_object(
+                &store,
+                namespace.clone(),
+                key.clone(),
+                ObjectMetadata::default(),
+                b"initial",
+            )
+            .await?;
+            let exe = std::env::current_exe()?;
+            let mut child = Command::new(&exe)
+                .args(["--exact", "cas_worker", "--nocapture"])
+                .env(WORKER_ROOT, root.path())
+                .env(WORKER_BODY, "after-crash")
+                .env(WORKER_EXPECTED, initial.version.get().to_string())
+                .env(WORKER_FAULT, fault)
+                .spawn()?;
+            let status = child.wait()?;
+            assert_eq!(
+                status.code(),
+                Some(137),
+                "iteration {iteration}, fault {fault} did not abort: {status}"
+            );
+            let current = store.get_object(&namespace, &key, None).await?;
+            assert!(current.version.get() == 1 || current.version.get() == 2);
+            let bytes = store.get_blob_bytes(&current.digest).await?;
+            assert!(bytes == b"initial" || bytes == b"after-crash");
+            assert_eq!(
+                store
+                    .get_object(&namespace, &key, Some(initial.version))
+                    .await?
+                    .version,
+                initial.version
+            );
+        }
     }
     Ok(())
 }
