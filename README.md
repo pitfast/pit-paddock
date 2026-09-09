@@ -68,9 +68,15 @@ Cloudflare, R2, or MinIO-specific behavior. Configure the endpoint, bucket,
 region, and credential environment variables in the caller; secrets are never
 part of manifests, refs, fingerprints, or normal output. Real local MinIO
 integration tests exercise blob/object PUT, GET, range, metadata, refs,
-overwrite, tombstone, and restart behavior. Portable S3 conditional ref CAS
-is intentionally not advertised because a provider-neutral two-object update
-cannot be made atomic by a read-then-write sequence.
+overwrite, tombstone, and restart behavior. Unknown S3-compatible endpoints
+remain non-authority-capable by default. An explicit provider profile may
+enable conditional authority with `RefCondition::Absent` using
+`If-None-Match: *` and `RefCondition::Version(n)` using the current provider
+ETag in `If-Match`. Precondition failures become typed `CasConflict` errors;
+Paddock never emulates CAS with a read/check/blind-write race.
+
+See [`docs/paddock-v1.2-authority-baseline.md`](docs/paddock-v1.2-authority-baseline.md)
+for the provider contract and the race being eliminated.
 
 ## CLI
 
@@ -92,9 +98,10 @@ prepared.
 `pit-paddock-s3` is an outbound backend adapter: Paddock uses an
 S3-compatible service for storage. It is not the inbound S3 compatibility API.
 Generic object blobs, version refs, range reads, and streamed uploads use
-vendor-neutral S3 operations. The SDK/backend currently does not advertise a
-portable conditional ref-update guarantee. Integration tests run only when an
-explicit real S3-compatible test configuration is provided.
+vendor-neutral S3 operations. The SDK/backend advertises conditional ref
+updates only for an explicit provider profile that has verified conditional
+PUT semantics. Integration tests run only when an explicit real
+S3-compatible test configuration is provided.
 
 The separate [`gateway/`](gateway/) workload is the inbound compatibility
 proof. It is a normal `wasi:http/proxy` component that imports only the generic
@@ -103,12 +110,12 @@ to run through PitLane. Its alpha subset is object `PUT`, `GET`, `HEAD`,
 `DELETE`, prefix listing, and single-range reads. The gateway returns the
 documented S3 XML subset, exposes deterministic ETags, and authenticates
 header-signed AWS SigV4 requests with a 15-minute clock-skew window. Multipart
-upload is bounded and durable across request executions. Presigned URLs,
-conditional requests, bucket policies, and full S3 compatibility are
-intentionally not claimed. It has no resident guest server; each request
-executes and then ends. AWS CLI 1.46.x is covered by the local interoperability
-test; other clients may require response-header features not yet exposed by
-the current HTTP component ABI.
+upload is bounded and durable across request executions. HEAD preserves the
+GET representation length while emitting no body, so AWS CLI and MinIO `mc`
+can stat and download objects through the same generic HTTP response path.
+Presigned URLs, conditional requests, bucket policies, and full S3
+compatibility are intentionally not claimed. It has no resident guest server;
+each request executes and then ends.
 
 ## Object contract
 
@@ -119,6 +126,21 @@ returns a streaming writer with `write_chunk`, `commit`, and `abort`; the
 buffered `put_object` helper is only a convenience wrapper. Backends expose
 range reads and a capability report so callers can distinguish guarantees
 instead of assuming S3 and filesystem semantics are identical.
+
+The authority capability is deliberately explicit:
+
+| Capability | Filesystem | S3-compatible default | Explicitly profiled S3 provider |
+|---|---:|---:|---:|
+| streaming writes | supported | supported | supported |
+| range reads | supported | supported | supported |
+| atomic ref replacement | supported | provider semantics | provider semantics |
+| conditional ref update | supported cross-process | not advertised | supported only after provider validation |
+| durable sync | file and directory `fsync` | provider durability | provider durability |
+
+An S3 endpoint with `conditional_ref_update = false` remains valid for
+unconditional object storage, but future authority-dependent engines must
+reject it before serving requests. Paddock does not claim that all
+S3-compatible providers implement the same conditional-write guarantees.
 
 ## Named Paddocks
 

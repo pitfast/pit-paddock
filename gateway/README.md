@@ -31,14 +31,13 @@ The current protocol is deliberately partial: the gateway validates request
 `Content-Length`, returns XML success/error/list bodies, exposes deterministic
 ETag and `Accept-Ranges` headers, supports one `bytes=start-end` range with
 `206` and `Content-Range`, and copies multipart parts in 64 KiB chunks.
-Presigned URLs, conditional requests, and bucket management remain deferred.
-The current HTTP component path does not reliably permit an explicit
-object-sized `Content-Length` on a HEAD/full-GET response, so AWS CLI
-interoperability is validated while clients that require that metadata (such
-as the tested mc version) remain partial.
+HEAD responses carry the corresponding GET representation length while
+publishing no body, which is required by standard HTTP clients. Presigned
+URLs, conditional requests, and bucket management remain deferred.
 
-AWS CLI 1.46.1 successfully exercises signed PUT, HEAD, GET, LIST, DELETE,
-UTF-8/space-containing keys, and range GET against the PitLane-routed gateway.
+AWS CLI 1.46.1 and MinIO `mc` RELEASE.2025-08-13T08-35-41Z successfully
+exercise signed PUT, HEAD/stat, GET, LIST, DELETE, UTF-8/space-containing
+keys, and range GET against the PitLane-routed gateway.
 
 For S3-shaped clients the fixed alpha bucket route is
 `/s3-alpha/<object-key>`; the legacy `/<object-key>` route is retained for

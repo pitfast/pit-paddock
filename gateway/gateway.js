@@ -184,6 +184,7 @@ function response(status, body = new Uint8Array(), contentType = 'text/plain', e
   const headers = new Fields();
   headers.set('content-type', [text(contentType)]);
   headers.set('cache-control', [text('no-store')]);
+  headers.set('content-length', [text(String(body.length))]);
   for (const [name, value] of extraHeaders) headers.set(name, [text(value)]);
   const outgoing = new OutgoingResponse(headers);
   outgoing.setStatusCode(status);
@@ -206,6 +207,22 @@ function response(status, body = new Uint8Array(), contentType = 'text/plain', e
   flushed[Symbol.dispose]();
   stream[Symbol.dispose]();
   OutgoingBody.finish(output, undefined);
+  return outgoing;
+}
+
+// HTTP HEAD carries the length of the corresponding GET representation but
+// has no response body. Calling outgoing.body() would make the Wasmtime HTTP
+// ABI enforce that representation length against zero bytes and turn a valid
+// HEAD response into a protocol error. Keeping this helper separate also
+// prevents accidentally using this contract for a normal GET.
+function responseHeadersOnly(status, representationLength, contentType = 'application/octet-stream', extraHeaders = []) {
+  const headers = new Fields();
+  headers.set('content-type', [text(contentType)]);
+  headers.set('cache-control', [text('no-store')]);
+  headers.set('content-length', [text(String(representationLength))]);
+  for (const [name, value] of extraHeaders) headers.set(name, [text(value)]);
+  const outgoing = new OutgoingResponse(headers);
+  outgoing.setStatusCode(status);
   return outgoing;
 }
 
@@ -582,7 +599,7 @@ export const incomingHandler = {
           if (found === null) {
             result = s3Error(404, 'NoSuchKey', 'The specified key does not exist.');
           } else if (method === 'HEAD') {
-            result = response(200, new Uint8Array(), found.contentType ?? 'application/octet-stream', [
+            result = responseHeadersOnly(200, Number(found.size), found.contentType ?? 'application/octet-stream', [
               ['accept-ranges', 'bytes'],
               ['etag', objectEtag(found)],
               ['last-modified', S3_LAST_MODIFIED],
