@@ -36,6 +36,10 @@ jobs:
       - name: Link sibling path dependency
         run: ln -s "$GITHUB_WORKSPACE/pit-crew" "$GITHUB_WORKSPACE/../pit-crew"
       - uses: dtolnay/rust-toolchain@stable
+      - name: Mask ephemeral MinIO credentials
+        run: |
+          echo "::add-mask::pitfast-test"
+          echo "::add-mask::pitfast-test-secret-123"
       - name: Create test bucket
         env:
           AWS_ACCESS_KEY_ID: pitfast-test
